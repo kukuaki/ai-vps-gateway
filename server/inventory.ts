@@ -113,7 +113,59 @@ if command -v systemctl >/dev/null 2>&1; then
     state=$(systemctl show "$unit" -p ActiveState -p SubState --value 2>/dev/null | awk 'NF {printf "%s%s", sep, $0; sep=" / "}')
     fragment=$(systemctl show "$unit" -p FragmentPath --value 2>/dev/null)
     workdir=$(systemctl show "$unit" -p WorkingDirectory --value 2>/dev/null)
-    printf 'SERVICE\tsystemd\t%s\t\t%s\t\t%s\t\t%s\t\n' "$unit" "$state" "$fragment" "$workdir"
+    printf 'SERVICE\tsystemd\t%s\t%s\t\t\t%s\t\t%s\t\n' "$unit" "$state" "$fragment" "$workdir"
+  done
+fi
+
+process_ports() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -lntpH 2>/dev/null |
+      awk -v process_pid="$1" 'index($0, "pid=" process_pid ",") {print $4}' |
+      sort -u |
+      awk 'NF {printf "%s%s", separator, $0; separator=";"}'
+  fi
+}
+
+PM2_ROWS=
+if command -v pm2 >/dev/null 2>&1; then
+  PM2_ROWS=$(pm2 list --no-color 2>/dev/null | awk -F '│' '
+function trim(value) {
+  gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+  return value
+}
+$2 ~ /^[[:space:]]*[0-9]+[[:space:]]*$/ {
+  id = trim($2)
+  name = trim($3)
+  pid = trim($7)
+  status = trim($10)
+  if (name != "" && pid ~ /^[0-9]+$/ && pid != "0") {
+    printf "%s\t%s\t%s\t%s\n", id, name, pid, status
+  }
+}')
+fi
+
+if [ -n "$PM2_ROWS" ]; then
+  tab=$(printf '\t')
+  printf '%s\n' "$PM2_ROWS" | while IFS="$tab" read -r pm_id pm_name pm_pid pm_status; do
+    [ -n "$pm_name" ] || continue
+    workdir=$(readlink -f "/proc/$pm_pid/cwd" 2>/dev/null)
+    ports=$(process_ports "$pm_pid")
+    printf 'SERVICE\tprocess\tpm2:%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n' "$pm_name" "$pm_name" "$pm_status" "$ports" "$workdir" "$pm_name" "$workdir"
+  done
+elif command -v ps >/dev/null 2>&1; then
+  ps -eo pid=,comm= 2>/dev/null | awk '$2 ~ /^(node|npm|pm2)$/ {print $1 "\t" $2}' | while IFS="$(printf '\t')" read -r process_pid process_command; do
+    [ -n "$process_pid" ] || continue
+    workdir=$(readlink -f "/proc/$process_pid/cwd" 2>/dev/null)
+    case "$workdir" in
+      /opt/*|/srv/*|/var/www/*|/home/*|/root/*) ;;
+      *) continue ;;
+    esac
+    case "$workdir" in
+      */.pm2|*/node_modules/pm2|*/node_modules/pm2/*) continue ;;
+    esac
+    ports=$(process_ports "$process_pid")
+    project_hint=$(basename "$workdir")
+    printf 'SERVICE\tprocess\tpid:%s\t%s · %s\t%s\t%s\t%s\t%s\t%s\t\n' "$process_pid" "$process_command" "$project_hint" "running" "$ports" "$workdir" "$project_hint" "$workdir"
   done
 fi
 
@@ -170,7 +222,7 @@ done`;
 
 const HEADERS = new Set(["__AI_VPS_GATEWAY_INVENTORY_V1__", "__AI_VPS_GATEWAY_INVENTORY_V2__"]);
 const MAX_FIELD_LENGTH = 500;
-const SYSTEMD_BASELINE_UNITS = /^(?:accounts-daemon|apparmor|atd|auditd|cloud-(?:config|final|init|init-local)|console-getty|containerd|cron|dbus|docker|emergency|finalrd|getty(?:@.*)?|irqbalance|iscsid|kmod|ModemManager|multipathd|NetworkManager|networkd|packagekit|polkit|rpcbind|rsyslog|serial-getty(?:@.*)?|snap\..*|snapd|ssh|sshd|systemd-[^.]+|udisks2|ufw|unattended-upgrades|unified-monitoring-agent|user@.*|wpa_supplicant)\.service$/i;
+const SYSTEMD_BASELINE_UNITS = /^(?:accounts-daemon|acpid|apparmor|atd|auditd|chrony|cloud-(?:config|final|init|init-local)|console-getty|containerd|cron|dbus|docker|emergency|finalrd|fwupd|getty(?:@.*)?|irqbalance|iscsid|kmod|ModemManager|multipathd|NetworkManager|networkd|networkd-dispatcher|packagekit|polkit|rpcbind|rsyslog|serial-getty(?:@.*)?|snap\..*|snapd|ssh|sshd|systemd-[^.]+|tat_agent|udisks2|ufw|unattended-upgrades|unified-monitoring-agent|upower|user@.*|wpa_supplicant)\.service$/i;
 
 function cleanField(value: string | undefined | null, maxLength = MAX_FIELD_LENGTH): string {
   if (!value) return "";
@@ -235,12 +287,20 @@ function isNestedApplicationManifest(project: RemoteInventoryProject, candidates
 }
 
 function belongsToProject(project: RemoteInventoryProject, service: RemoteInventoryService): boolean {
-  if (service.projectPath && normalizedProjectPath(service.projectPath) === project.path) return true;
+  const pathCandidate = service.manager === "docker"
+    ? service.projectPath
+    : service.workingDirectory ?? service.projectPath;
+  const servicePath = normalizedProjectPath(pathCandidate ?? "");
+  if (servicePath && project.path && (servicePath === project.path || servicePath.startsWith(project.path + "/"))) return true;
   const projectName = normalizedProjectName(project.name);
   const hint = normalizedProjectName(service.projectHint ?? "");
   if (hint && (hint === projectName || projectName.includes(hint) || hint.includes(projectName))) return true;
   const serviceName = normalizedProjectName(service.name + service.identifier + (service.image ?? ""));
-  return projectName.length >= 3 && serviceName.includes(projectName);
+  if (projectName.length >= 3 && serviceName.includes(projectName)) return true;
+  const projectTokens = unique((project.name + " " + basename(project.path)).split(/[^a-z0-9\u4e00-\u9fff]+/i))
+    .map(normalizedProjectName)
+    .filter((token) => token.length >= 5);
+  return projectTokens.some((token) => serviceName.includes(token));
 }
 
 function dockerGroupForService(name: string, image: string | null, allServices: RemoteInventoryService[]): string {
@@ -283,6 +343,22 @@ function serviceFromFields(fields: string[]): RemoteInventoryService | null {
       mounts: oldFormat ? [] : unique(cleanField(fields[10]).split(/;\s*/))
     };
   }
+  if (manager === "process") {
+    const ports = cleanField(fields[5]) || null;
+    return {
+      manager,
+      name: cleanField(fields[3], 120) || identifier,
+      identifier,
+      image: null,
+      status: cleanField(fields[4]),
+      ports,
+      portMappings: unique((ports ?? "").split(/;\s*/).filter(Boolean).map((port) => "监听: " + port)),
+      projectPath: normalizedProjectPath(cleanField(fields[6])) || null,
+      projectHint: cleanField(fields[7]) || null,
+      workingDirectory: cleanField(fields[8]) || null,
+      mounts: []
+    };
+  }
   return {
     manager,
     name: identifier.replace(/\.service$/, ""),
@@ -303,6 +379,15 @@ function firstPort(value: string | null): number | null {
   if (!match) return null;
   const port = Number(match[1]);
   return port >= 1 && port <= 65_535 ? port : null;
+}
+
+function serviceListensOnPort(service: RemoteInventoryService, port: number): boolean {
+  const values = [service.ports ?? "", ...service.portMappings];
+  return values.some((value) => {
+    const hostPorts = [...value.matchAll(/:(\d{1,5})(?=\/(?:tcp|udp)|\s|;|$)/gi)].map((match) => Number(match[1]));
+    const declaredPorts = [...value.matchAll(/(?:^|[\s;])(\d{1,5})\/(?:tcp|udp)(?=\s|;|$)/gi)].map((match) => Number(match[1]));
+    return [...hostPorts, ...declaredPorts].includes(port);
+  });
 }
 
 function inferStack(kind: string, manifest: string, dependencies: string[] = []): string[] {
@@ -332,6 +417,19 @@ function inferStack(kind: string, manifest: string, dependencies: string[] = [])
 
 function addStack(project: RemoteInventoryProject, values: string[]): void {
   project.technologyStack = unique([...project.technologyStack, ...values]).sort((left, right) => left.localeCompare(right));
+}
+
+function upstreamPortOf(upstream: string | null): number | null {
+  if (!upstream || upstream.includes("$")) return null;
+  try {
+    const parsed = new URL(upstream);
+    const port = parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : parsed.protocol === "http:" ? 80 : 0;
+    return port >= 1 && port <= 65_535 ? port : null;
+  } catch {
+    const match = /:(\d{1,5})(?:\/|$)/.exec(upstream);
+    const port = Number(match?.[1] ?? 0);
+    return port >= 1 && port <= 65_535 ? port : null;
+  }
 }
 
 function endpointFromRoute(route: RemoteInventoryWebRoute, hostname: string): ProjectWebEndpoint | null {
@@ -406,12 +504,15 @@ function runbookFor(server: ServerRecord, inventory: ServerInventory, projectPat
   const location = projectPath ?? "远程主机当前登记的服务";
   const serviceNames = services.map((service) => service.name);
   const endpointText = endpoints.length ? endpoints.map((endpoint) => endpoint.url + (endpoint.port ? " (:" + endpoint.port + ")" : "")).join("、") : "无已确认 Web 入口";
+  const endpointChains = endpoints
+    .map((endpoint) => endpoint.url + (endpoint.serviceName ? " -> " + endpoint.serviceName : "") + (endpoint.notes ? "；" + endpoint.notes : ""))
+    .join("；") || "未确认域名到运行服务的转发链路";
   const stackText = technologyStack.length ? technologyStack.join("、") : "尚未识别技术栈";
   const portText = unique(services.flatMap((service) => service.portMappings)).join("、") || "未读取到服务端口映射";
   return {
     overview: "自动盘点记录，运行节点：" + server.name + "。位置：" + location + "。主机：" +
       (inventory.hostname ?? "未知") + "；系统：" + (inventory.os ?? "未知") + "；内核：" +
-      (inventory.kernel ?? "未知") + "。技术栈：" + stackText + "。Web 入口：" + endpointText + "。这份档案由网关只读采集生成，未读取密钥、环境变量、业务数据或完整配置。",
+      (inventory.kernel ?? "未知") + "。技术栈：" + stackText + "。Web 入口：" + endpointText + "。入口链路：" + endpointChains + "。这份档案由网关只读采集生成，未读取密钥、环境变量、业务数据或完整配置。",
     deployment: "当前仅记录远程现状，不自动执行部署。变更前先确认项目路径、服务管理器、监听端口和回滚方式；涉及 " +
       (serviceNames.join("、") || "未识别服务") + " 时通过网关独占会话操作。容器内部和宿主端口映射：" + portText + "。涉及数据库、Web 入口、代理节点或线上数据目录时先确认备份和回滚。",
     verification: "变更后依次检查服务状态、监听端口和访问地址；再运行网关测活与当前性能采集。当前盘点发现的监听端口：" +
@@ -427,7 +528,40 @@ function routeMatchesProject(project: RemoteInventoryProject, route: RemoteInven
   const routeToken = normalizedProjectName(route.configPath + " " + (route.upstream ?? "") + " " + (route.serviceName ?? ""));
   if (hintToken && (hintToken === projectToken || projectToken.includes(hintToken) || hintToken.includes(projectToken))) return true;
   if (projectToken.length >= 3 && routeToken.includes(projectToken)) return true;
-  return services.some((service) => service.name === route.serviceName && belongsToProject(project, service));
+  const pathMatches = Boolean(project.path && [route.configPath, route.root]
+    .filter((value): value is string => Boolean(value))
+    .some((value) => value === project.path || value.startsWith(project.path + "/")));
+  if (pathMatches) return true;
+  return services.some((service) => belongsToProject(project, service) && (
+    service.name === route.serviceName ||
+    Boolean(route.upstreamPort && serviceListensOnPort(service, route.upstreamPort))
+  ));
+}
+
+function servicesForRoute(route: RemoteInventoryWebRoute, services: RemoteInventoryService[]): RemoteInventoryService[] {
+  const result = new Set<RemoteInventoryService>();
+  const routeServiceName = route.source.startsWith("docker:") ? route.source.slice("docker:".length) : route.source;
+  for (const service of services) {
+    const serviceToken = normalizedProjectName(service.name);
+    const identifierToken = normalizedProjectName(service.identifier);
+    const routeServiceToken = normalizedProjectName(routeServiceName);
+    const isRouteManager = Boolean(routeServiceToken && (serviceToken === routeServiceToken || identifierToken === routeServiceToken));
+    const isUpstream = Boolean(
+      (route.serviceName && service.name === route.serviceName) ||
+      (route.upstreamPort && serviceListensOnPort(service, route.upstreamPort))
+    );
+    if (isRouteManager || isUpstream) result.add(service);
+  }
+  return [...result];
+}
+
+function servicesForProject(project: RemoteInventoryProject, inventory: ServerInventory): RemoteInventoryService[] {
+  const result = new Set(inventory.services.filter((service) => belongsToProject(project, service)));
+  const matchingRoutes = inventory.webRoutes.filter((route) => routeMatchesProject(project, route, inventory.services));
+  for (const route of matchingRoutes) {
+    for (const service of servicesForRoute(route, inventory.services)) result.add(service);
+  }
+  return [...result];
 }
 
 function endpointsForProject(
@@ -461,8 +595,10 @@ function inferredTechnologyStack(project: RemoteInventoryProject, services: Remo
   for (const service of services) {
     if (service.manager === "docker") stack.push("Docker");
     if (service.manager === "systemd") stack.push("systemd");
+    if (service.manager === "process") stack.push("Node.js");
     const value = (service.name + " " + (service.image ?? "")).toLowerCase();
     if (value.includes("nginx")) stack.push("Nginx");
+    if (service.identifier.startsWith("pm2:") || value.includes("pm2")) stack.push("PM2");
     if (value.includes("postgres")) stack.push("PostgreSQL");
     if (value.includes("pgvector")) stack.push("pgvector");
     if (value.includes("s-ui") || value.includes("sui")) stack.push("S-UI");
@@ -492,7 +628,7 @@ export function discoveredProjectsForInventory(server: ServerRecord, inventory: 
   const assigned = new Set<RemoteInventoryService>();
 
   for (const project of candidates) {
-    const discoveredServices = inventory.services.filter((service) => belongsToProject(project, service));
+    const discoveredServices = servicesForProject(project, inventory);
     discoveredServices.forEach((service) => assigned.add(service));
     const technologyStack = inferredTechnologyStack(project, discoveredServices);
     const webEndpoints = endpointsForProject(project, server, inventory, discoveredServices);
@@ -568,6 +704,30 @@ export function discoveredProjectsForInventory(server: ServerRecord, inventory: 
   for (const endpoint of fallbackEndpoints) {
     const key = endpoint.url;
     if (matchedEndpoints.has(key)) continue;
+    const fallbackProject = projects.get(server.id + ":unassigned");
+    const sourceRoute = inventory.webRoutes.find((route) => route.hostnames.some((hostname) => endpoint.url.includes(hostname)));
+    if (fallbackProject && sourceRoute) {
+      const knownServices = new Map((fallbackProject.services ?? []).map((service) => [service.manager + ":" + service.identifier, service]));
+      for (const service of servicesForRoute(sourceRoute, inventory.services)) {
+        const input = serviceInput(server, service);
+        knownServices.set(input.manager + ":" + input.identifier, input);
+      }
+      fallbackProject.services = [...knownServices.values()];
+      fallbackProject.webEndpoints = dedupeEndpoints([...(fallbackProject.webEndpoints ?? []), endpoint]);
+      const fallbackRemoteProject: RemoteInventoryProject = {
+        key: fallbackProject.sourceKey,
+        name: fallbackProject.name,
+        path: fallbackProject.repositoryPath ?? "",
+        manifest: "remote-services",
+        technologyStack: fallbackProject.technologyStack ?? [],
+        webEndpoints: fallbackProject.webEndpoints
+      };
+      const fallbackServices = inventory.services.filter((service) => fallbackProject.services?.some((item) => item.identifier === service.identifier));
+      fallbackProject.technologyStack = inferredTechnologyStack(fallbackRemoteProject, fallbackServices);
+      fallbackProject.runbook = runbookFor(server, inventory, fallbackProject.repositoryPath ?? null, fallbackServices, fallbackProject.technologyStack, fallbackProject.webEndpoints);
+      matchedEndpoints.add(key);
+      continue;
+    }
     const hostname = endpoint.label || endpoint.url;
     projects.set(server.id + ":web:" + hostname, {
       sourceKey: server.id + ":web:" + hostname,
@@ -708,33 +868,39 @@ export function parseInventoryOutput(serverId: string, output: string, collected
   const webRoutes: RemoteInventoryWebRoute[] = [...routeStates.values()].map((route) => {
     const upstream = [...route.upstreams][0] ?? null;
     const upstreamHost = upstream?.replace(/^[a-z]+:\/\//i, "").split(/[/:]/)[0] ?? null;
+    const upstreamPort = upstreamPortOf(upstream);
     const upstreamToken = normalizedProjectName(upstreamHost ?? "");
-    const service = upstreamHost
+    const hostService = upstreamHost
       ? serviceValues.find((item) =>
         item.name === upstreamHost ||
         item.identifier === upstreamHost ||
         (Boolean(upstreamToken) && (normalizedProjectName(item.name) === upstreamToken || normalizedProjectName(item.identifier) === upstreamToken))
       )
       : undefined;
-    const projectHint = /(?:zongde|zhongde)/i.test(route.configPath) ? "zongde" : service?.projectHint ?? null;
+    const portService = upstreamPort ? serviceValues.find((item) => serviceListensOnPort(item, upstreamPort)) : undefined;
+    const service = hostService ?? portService;
+    const root = [...route.roots][0] ?? null;
+    const rootProject = root
+      ? [...projects.values()].find((project) => project.path && (root === project.path || root.startsWith(project.path + "/")))
+      : undefined;
+    const projectHint = /(?:zongde|zhongde)/i.test(route.configPath)
+      ? "zongde"
+      : service?.projectHint ?? rootProject?.name ?? null;
     return {
       source: route.source,
       configPath: route.configPath,
       hostnames: [...route.hostnames].sort(),
       ports: uniqueNumbers([...route.ports]),
       upstream,
-      root: [...route.roots][0] ?? null,
+      upstreamPort,
+      root,
       serviceName: service?.name ?? upstreamHost,
       projectHint
     };
   }).filter((route) => route.hostnames.length || route.upstream || route.root);
 
   for (const project of projects.values()) {
-    const matchingRoutes = webRoutes.filter((route) => {
-      const hintMatches = Boolean(route.projectHint && normalizedProjectName(route.projectHint) === normalizedProjectName(project.name));
-      const pathMatches = Boolean(project.path && route.configPath.includes(project.path));
-      return hintMatches || pathMatches;
-    });
+    const matchingRoutes = webRoutes.filter((route) => routeMatchesProject(project, route, serviceValues));
     project.webEndpoints = dedupeEndpoints(
       matchingRoutes
         .flatMap((route) => route.hostnames.map((hostname) => endpointFromRoute(route, hostname)))
@@ -767,22 +933,27 @@ export function parseInventoryOutput(serverId: string, output: string, collected
   }
 
   const finalProjects = [...projects.values()];
-  for (const project of finalProjects) {
-    const projectServices = serviceValues.filter((service) => belongsToProject(project, service));
-    addStack(project, inferredTechnologyStack(project, projectServices));
-  }
-
-  return {
+  const inventoryContext: ServerInventory = {
     serverId,
     collectedAt,
     hostname: metadata.get("hostname") || null,
     os: metadata.get("os") || null,
     kernel: metadata.get("kernel") || null,
     dockerAvailable: metadata.get("docker") === "available",
-    projects: finalProjects.sort((left, right) => (left.path + ":" + left.name).localeCompare(right.path + ":" + right.name)),
-    services: serviceValues.sort((left, right) => (left.manager + ":" + left.name).localeCompare(right.manager + ":" + right.name)),
+    projects: finalProjects,
+    services: serviceValues,
     webRoutes,
     listeningPorts: unique(listeningPorts).sort(),
     warnings
+  };
+  for (const project of finalProjects) {
+    const projectServices = servicesForProject(project, inventoryContext);
+    addStack(project, inferredTechnologyStack(project, projectServices));
+  }
+
+  return {
+    ...inventoryContext,
+    projects: finalProjects.sort((left, right) => (left.path + ":" + left.name).localeCompare(right.path + ":" + right.name)),
+    services: serviceValues.sort((left, right) => (left.manager + ":" + left.name).localeCompare(right.manager + ":" + right.name))
   };
 }

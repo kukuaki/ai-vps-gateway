@@ -247,6 +247,37 @@ function normalizedStringList(values: string[] | undefined | null): string[] {
   return [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
 }
 
+function comparableProjectServices(services: Array<ProjectService | ProjectServiceInput>): Array<{
+  serverId: string;
+  name: string;
+  manager: ServiceManager;
+  identifier: string;
+  port: number | null;
+  portMappings: string[];
+  accessUrl: string | null;
+  critical: boolean;
+  notes: string;
+}> {
+  return services
+    .map((service) => ({
+      serverId: service.serverId,
+      name: service.name,
+      manager: service.manager,
+      identifier: service.identifier,
+      port: service.port ?? null,
+      portMappings: normalizedStringList(service.portMappings),
+      accessUrl: service.accessUrl ?? null,
+      critical: Boolean(service.critical),
+      notes: service.notes ?? ""
+    }))
+    .sort((left, right) =>
+      Number(right.critical) - Number(left.critical) ||
+      left.name.localeCompare(right.name) ||
+      left.manager.localeCompare(right.manager) ||
+      left.identifier.localeCompare(right.identifier)
+    );
+}
+
 function normalizedWebEndpoints(values: ProjectWebEndpoint[] | undefined | null): ProjectWebEndpoint[] {
   const endpoints = (values ?? [])
     .map((endpoint) => ({
@@ -1300,17 +1331,7 @@ export class GatewayDatabase {
 
     const existing = this.getProject(existingRow.id, true);
     if (!existing) throw new Error(`自动发现项目不存在：${input.sourceKey}`);
-    const sameServices = JSON.stringify(existing.services.map((service) => ({
-      serverId: service.serverId,
-      name: service.name,
-      manager: service.manager,
-      identifier: service.identifier,
-      port: service.port,
-      portMappings: service.portMappings,
-      accessUrl: service.accessUrl,
-      critical: service.critical,
-      notes: service.notes
-    }))) === JSON.stringify(services.map((service) => ({ ...service, portMappings: normalizedStringList(service.portMappings) })));
+    const sameServices = JSON.stringify(comparableProjectServices(existing.services)) === JSON.stringify(comparableProjectServices(services));
     const preservedManualEndpoints = existing.webEndpoints.filter((endpoint) => endpoint.source === "manual");
     const nextWebEndpoints = normalizedWebEndpoints([...preservedManualEndpoints, ...discoveredWebEndpoints]);
     const nextTechnologyStack = normalizedStringList([...existing.technologyStack, ...discoveredTechnologyStack]);

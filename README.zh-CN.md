@@ -91,7 +91,7 @@ npm run sync:all-vps
 
 ## 同步远程项目
 
-项目盘点通过只读 SSH 执行，只收集有限元数据：主机名、系统、Docker 容器名称/镜像/状态/端口映射/挂载、非基础 systemd 服务、监听 TCP 端口、项目清单路径和依赖名称，以及筛选后的 Web 路由指令（`server_name`、`listen`、`proxy_pass`、`root`）。不会读取环境变量、日志、私钥、Token 或完整配置文件。结果保存在本机，并按稳定的 `remote-inventory` 标识创建或更新项目档案，自动填写技术栈、项目级 Web 入口（发现到时）、详细服务清单、项目概览、部署步骤、验证步骤、排错手册和变更边界。消失的自动项目只会归档不会删除；如果盘点有警告，也不会执行缺失项目归档。
+项目盘点通过只读 SSH 执行，只收集有限元数据：主机名、系统、Docker 容器名称/镜像/状态/端口映射/挂载、非基础 systemd 服务、PM2/Node 进程名称、PID、工作目录和监听端口、项目清单路径和依赖名称，以及筛选后的 Web 路由指令（`server_name`、`listen`、`proxy_pass`、`root`）。不会读取环境变量、日志、私钥、Token 或完整配置文件。Nginx 路由会依据静态目录、反代上游端口、进程工作目录和服务管理器证据归并到项目；域名只记录为项目 Web 入口，不会单独生成“域名项目”。结果保存在本机，并按稳定的 `remote-inventory` 标识创建或更新项目档案，自动填写技术栈、项目级 Web 入口（发现到时）、详细服务清单、项目概览、部署步骤、验证步骤、排错手册和变更边界。消失的自动项目只会归档不会删除；如果盘点有警告，也不会执行缺失项目归档。
 
 ```bash
 npm run sync:vps-projects
@@ -134,6 +134,20 @@ npm run import:all-vps-credentials
 正常执行流程是：先 `open_session`，如果返回排队就等待，再通过 `run_command` 执行，必要时使用 `collect_metrics` 获取当前性能，完成后 `close_session`。root VPS 通过正常凭据和主机指纹检查后即可走同一流程；WebUI 的 root 救援提示只是额外的高危告警和审计信号。API 和 MCP 适配器默认只绑定 `127.0.0.1`，AI 不会拿到私钥或任意本机 SSH 路径。
 
 项目 Runbook 分为项目概览、部署步骤、验证步骤、排错手册和变更边界五部分。当前保存在本机 SQLite，供后续 AI 会话通过只读 MCP 查询；不要在 Runbook 中写入密码、Token、私钥或完整环境变量。
+
+在当前这个仓库中，先启动本机 API/WebUI，再分别注册 MCP：
+
+```bash
+npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run dev
+
+codex mcp add ai-vps-gateway -- npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run mcp
+codex mcp get ai-vps-gateway
+
+claude mcp add --scope user ai-vps-gateway -- npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run mcp
+claude mcp get ai-vps-gateway
+```
+
+注册后如果客户端已经打开，重启对应客户端让工具列表刷新。在对话中直接要求 Agent 使用 `ai-vps-gateway`，例如：“先读取项目 Runbook，再盘点目标 VPS；需要改动时申请独占会话，通过网关执行，完成后释放会话。”正常流程是用 `get_project`/`list_servers` 获取上下文，用 `open_session` -> `run_command` 执行运维，最后调用 `close_session`。
 
 ## 许可证
 

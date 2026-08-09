@@ -69,7 +69,7 @@ describe("remote project inventory", () => {
       "SERVICE\tdocker\tzongde-web\tzhongde-web:20260809\trunning / health=healthy\t\t3000/tcp\t/opt/zhongde\tzongde\t/app\t/opt/zhongde/releases/current -> /app",
       "SERVICE\tdocker\tzongde-nginx\tnginx:1.27-alpine\trunning\t80/tcp -> 0.0.0.0:80; 443/tcp -> 0.0.0.0:443\t80/tcp 443/tcp\t/opt/zhongde\tzongde\t\t/etc/zhongde/nginx -> /etc/nginx/conf.d",
       "SERVICE\tdocker\tzongde-postgres\tpgvector/pgvector:pg16\trunning\t\t5432/tcp\t/opt/zhongde\tzongde\t\t/opt/zhongde/postgres -> /var/lib/postgresql/data",
-      "SERVICE\tdocker\ts-ui\talireza7/s-ui:latest\trunning\t2095/tcp -> 0.0.0.0:2095; 8388/tcp -> 0.0.0.0:8388\t2095/tcp 8388/tcp\t\ts-ui\t\t",
+      "SERVICE\tdocker\ts-ui\talireza7/s-ui:latest\trunning\t2095/tcp -> 0.0.0.0:2095; 8388/tcp -> 0.0.0.0:8388\t2095/tcp 8388/tcp\t\ts-ui\t/app\t",
       "WEB\tnginx\t/etc/zhongde/nginx/site.conf\tserver_name zongde.ltd www.zongde.ltd;",
       "WEB\tnginx\t/etc/zhongde/nginx/site.conf\tlisten 443 ssl;",
       "WEB\tnginx\t/etc/zhongde/nginx/site.conf\tproxy_pass http://zhongde-web:3100;",
@@ -112,6 +112,71 @@ describe("remote project inventory", () => {
     assert.deepEqual(saved.project.webEndpoints, zongde.webEndpoints);
     assert.deepEqual(saved.project.technologyStack, zongde.technologyStack);
     assert.ok(saved.project.services.some((service) => service.portMappings.includes("443/tcp -> 0.0.0.0:443")));
+    database.close();
+  });
+
+  it("merges an Nginx domain with the project served by a PM2 process", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-inventory-proxy-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "国内节点", address: "203.0.113.72", sshPort: 22, sshUser: "ubuntu" });
+    const inventory = parseInventoryOutput(server.id, [
+      "__AI_VPS_GATEWAY_INVENTORY_V2__",
+      "META\thostname\tcontest-01",
+      "META\tos\tUbuntu 24.04",
+      "PROJECT\tnode\t/opt/payment_approval/package.json",
+      "SERVICE\tprocess\tpm2:payment-api\tpayment-api\tonline\t127.0.0.1:3334\t/opt/payment_approval/server\tpm2\t/opt/payment_approval/server\t",
+      "SERVICE\tsystemd\tnginx.service\tactive / running\t\t\t/usr/lib/systemd/system/nginx.service\t\t\t",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf\tserver_name pay.kukuaki.me;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf\tlisten 443 ssl;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf\troot /opt/payment_approval/client/dist;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf\tproxy_pass http://127.0.0.1:3334/api/;",
+      "PORT\ttcp\t0.0.0.0:443",
+      "PORT\ttcp\t127.0.0.1:3334",
+      ""
+    ].join("\n"));
+
+    const discovered = discoveredProjectsForInventory(server, inventory);
+    assert.equal(discovered.length, 1);
+    const payment = discovered[0]!;
+    assert.equal(payment.name, "国内节点 · payment_approval");
+    const endpoints = payment.webEndpoints ?? [];
+    assert.deepEqual(endpoints.map((endpoint) => endpoint.url), ["https://pay.kukuaki.me"]);
+    assert.equal(endpoints[0]?.serviceName, "payment-api");
+    assert.ok(payment.services?.some((service) => service.manager === "process" && service.name === "payment-api" && service.port === 3334));
+    assert.ok(payment.services?.some((service) => service.manager === "systemd" && service.name === "nginx"));
+    assert.ok(payment.technologyStack?.includes("PM2"));
+    assert.ok(payment.technologyStack?.includes("Nginx"));
+    assert.ok(payment.runbook.overview.includes("pay.kukuaki.me -> payment-api"));
+    assert.equal(database.syncDiscoveredProject(payment).action, "created");
+    assert.equal(database.syncDiscoveredProject(payment).action, "unchanged");
+    database.close();
+  });
+
+  it("keeps an unresolved domain inside the unclassified service group", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-inventory-unclassified-route-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "代理节点", address: "203.0.113.73", sshPort: 22, sshUser: "root" });
+    const inventory = parseInventoryOutput(server.id, [
+      "__AI_VPS_GATEWAY_INVENTORY_V2__",
+      "META\thostname\tproxy-01",
+      "SERVICE\tsystemd\tnginx.service\tactive / running\t\t\t/usr/lib/systemd/system/nginx.service\t\t\t",
+      "SERVICE\tsystemd\tsing-box.service\tactive / running\t\t\t/usr/lib/systemd/system/sing-box.service\t\t\t",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf\tserver_name cf-node.example.com;",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf\tlisten 443 ssl;",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf\tproxy_pass http://127.0.0.1:10085;",
+      "PORT\ttcp\t127.0.0.1:10085",
+      ""
+    ].join("\n"));
+
+    const discovered = discoveredProjectsForInventory(server, inventory);
+    assert.equal(discovered.length, 1);
+    assert.equal(discovered[0]?.name, "代理节点 · 未归类服务");
+    assert.deepEqual(discovered[0]?.webEndpoints?.map((endpoint) => endpoint.url), ["https://cf-node.example.com"]);
+    assert.ok(discovered[0]?.services?.some((service) => service.name === "nginx"));
+    assert.ok(discovered[0]?.services?.some((service) => service.name === "sing-box"));
+    assert.ok(!discovered.some((project) => project.sourceKey.includes(":web:")));
     database.close();
   });
 });

@@ -154,6 +154,7 @@ export interface RemoteInventoryWebRoute {
   hostnames: string[];
   ports: number[];
   upstream: string | null;
+  upstreamPort: number | null;
   root: string | null;
   serviceName: string | null;
   projectHint: string | null;

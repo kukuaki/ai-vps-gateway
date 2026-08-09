@@ -91,7 +91,7 @@ Synchronization identifies an asset by SSH address and port, then updates docume
 
 ## Synchronizing Remote Projects
 
-The project inventory is a read-only SSH operation. It collects bounded metadata only: hostname, OS, Docker container names/images/status/port mappings/mounts, non-baseline systemd units, listening TCP ports, project manifest paths and dependency names, plus filtered Web routing directives (`server_name`, `listen`, `proxy_pass`, and `root`). It does not read environment variables, logs, private keys, tokens, or complete configuration files. The result is stored locally and used to create or update deterministic `remote-inventory` projects with technology-stack labels, project-level Web endpoints when discovered, detailed services, and overview, deployment, verification, troubleshooting, and guardrail sections. Missing automatic projects are archived rather than deleted, and a warning-bearing partial inventory does not archive anything.
+The project inventory is a read-only SSH operation. It collects bounded metadata only: hostname, OS, Docker container names/images/status/port mappings/mounts, non-baseline systemd units, PM2 or Node process names/PIDs/working directories/listening ports, project manifest paths and dependency names, plus filtered Web routing directives (`server_name`, `listen`, `proxy_pass`, and `root`). It does not read environment variables, logs, private keys, tokens, or complete configuration files. Nginx routes are associated with a project through the static root, upstream port, process working directory, and service manager evidence; a domain is therefore stored as a project Web endpoint instead of becoming a standalone project. The result is stored locally and used to create or update deterministic `remote-inventory` projects with technology-stack labels, project-level Web endpoints when discovered, detailed services, and overview, deployment, verification, troubleshooting, and guardrail sections. Missing automatic projects are archived rather than deleted, and a warning-bearing partial inventory does not archive anything.
 
 ```bash
 npm run sync:vps-projects
@@ -134,6 +134,20 @@ Available tools include `list_servers`, `get_server`, `get_dashboard`, `list_pro
 The normal execution flow is: open a session, wait if it is queued, run commands through `run_command`, collect current metrics when needed, then close the session. A root VPS follows the same flow after normal credential and host-key checks; the optional WebUI root-rescue marker is only an additional warning and audit signal. The API and MCP adapter remain bound to `127.0.0.1`; the AI client receives neither a private key nor an unrestricted local SSH path.
 
 Each project runbook has five sections: overview, deployment, verification, troubleshooting, and guardrails. It is stored in local SQLite and exposed to later AI sessions through read-only MCP queries. Do not put passwords, tokens, private keys, or complete environment variables in a runbook.
+
+For this checkout, start the local API/WebUI and register the stdio server with the clients:
+
+```bash
+npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run dev
+
+codex mcp add ai-vps-gateway -- npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run mcp
+codex mcp get ai-vps-gateway
+
+claude mcp add --scope user ai-vps-gateway -- npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run mcp
+claude mcp get ai-vps-gateway
+```
+
+Restart the client after registration if its tool list was already open. In a conversation, ask the agent to use the `ai-vps-gateway` tools, for example: “先读取项目 Runbook，再盘点目标 VPS；如果需要改动，申请独占会话后通过网关执行，完成后释放会话。” The agent should use `get_project`/ `list_servers` for context, `open_session` -> `run_command` for operations, and `close_session` when finished.
 
 ## License
 
