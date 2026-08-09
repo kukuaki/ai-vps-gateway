@@ -68,6 +68,7 @@ const isSessionAction = ref(false);
 const isCollectingMetrics = ref(false);
 const isRootAction = ref(false);
 const projectQuery = ref("");
+const ROOT_ACCESS_DURATION_MS = 8 * 60 * 60_000;
 
 interface FormState {
   name: string;
@@ -251,6 +252,14 @@ function emergencyRootActive(server: ServerRecord): boolean {
   return Boolean(server.emergencyRootUntil && Date.parse(server.emergencyRootUntil) > Date.now());
 }
 
+function metricNoteFor(server: ServerRecord): string | null {
+  const note = selected.value?.metric?.note ?? null;
+  if (server.sshUser === "root" && emergencyRootActive(server) && note?.includes("使用 root SSH 登录")) {
+    return "root 访问已启用，点击刷新即可重新采集当前性能";
+  }
+  return note;
+}
+
 function syncActionLabel(action: AllVpsSyncPreview["changes"][number]["action"]): string {
   return { created: "新增", updated: "更新", unchanged: "无变更" }[action];
 }
@@ -330,18 +339,20 @@ async function closeAiSession(): Promise<void> {
   }
 }
 
-async function grantEmergencyRoot(server: ServerRecord): Promise<void> {
-  if (!window.confirm(`将为 ${server.name} 开启 30 分钟紧急 root 救援，期间 AI 会话可直接使用 root SSH。继续？`)) return;
+async function enableRootAndOpenSession(server: ServerRecord): Promise<void> {
   isRootAction.value = true;
+  isSessionAction.value = true;
   errorMessage.value = null;
   try {
-    await api.grantEmergencyRoot(server.id);
-    notify(`${server.name} 的紧急 root 救援已开启 30 分钟`);
+    await api.grantEmergencyRoot(server.id, ROOT_ACCESS_DURATION_MS);
+    const result = await api.openSession(server.id, "webui");
+    notify(result.session.status === "active" ? `${server.name} 已启用 root 访问 8 小时并开启会话` : `${server.name} 已启用 root 访问 8 小时，AI 会话排队第 ${result.session.queuePosition} 位`);
     await refresh(server.id);
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法开启紧急 root 救援";
+    errorMessage.value = error instanceof Error ? error.message : "无法启用 root 访问";
   } finally {
     isRootAction.value = false;
+    isSessionAction.value = false;
   }
 }
 
@@ -350,10 +361,10 @@ async function revokeEmergencyRoot(server: ServerRecord): Promise<void> {
   errorMessage.value = null;
   try {
     await api.revokeEmergencyRoot(server.id);
-    notify(`${server.name} 的紧急 root 救援已关闭`);
+    notify(`${server.name} 的 root 访问已关闭`);
     await refresh(server.id);
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法关闭紧急 root 救援";
+    errorMessage.value = error instanceof Error ? error.message : "无法关闭 root 访问";
   } finally {
     isRootAction.value = false;
   }
@@ -733,13 +744,13 @@ onMounted(() => void refresh());
         <template v-if="selectedServer">
           <section class="detail-header">
             <div><div class="server-title"><span :class="['status-dot', statusOf(selectedServer.status).tone]"></span><h2>{{ selectedServer.name }}</h2><span :class="['status-badge', statusOf(selectedServer.status).tone]">{{ statusOf(selectedServer.status).label }}</span></div><p>{{ selectedServer.sshUser }}@{{ selectedServer.address }}:{{ selectedServer.sshPort }} <span v-if="selectedServer.role">· {{ selectedServer.role }}</span></p></div>
-            <div class="detail-actions"><a v-if="selectedServer.accessUrl" class="icon-button link-button" :href="selectedServer.accessUrl" target="_blank" rel="noreferrer" title="打开访问地址"><Globe2 :size="18" /></a><button class="icon-button" title="立即测活" :disabled="isProbing === selectedServer.id" @click="probe(selectedServer)"><RefreshCw :size="18" :class="{ spinning: isProbing === selectedServer.id }" /></button><button v-if="selectedServer.sshUser === 'root' && !emergencyRootActive(selectedServer)" class="danger-button" :disabled="isRootAction" @click="grantEmergencyRoot(selectedServer)"><ShieldCheck :size="16" /> 开启紧急 root</button><button v-else-if="!selectedServerSession" class="secondary-button" :disabled="isSessionAction" @click="openAiSession(selectedServer)"><ShieldCheck :size="16" /> 开启会话</button><button v-else class="secondary-button" :disabled="isSessionAction" @click="closeAiSession"><X :size="16" /> 释放会话</button><button v-if="selectedServer.sshUser === 'root' && emergencyRootActive(selectedServer)" class="icon-button" title="关闭紧急 root 救援" :disabled="isRootAction" @click="revokeEmergencyRoot(selectedServer)"><ShieldCheck :size="17" /></button><button class="secondary-button" @click="openEdit(selectedServer)">编辑</button><button class="danger-button" @click="archive(selectedServer)"><Archive :size="16" /> 归档</button></div>
+            <div class="detail-actions"><a v-if="selectedServer.accessUrl" class="icon-button link-button" :href="selectedServer.accessUrl" target="_blank" rel="noreferrer" title="打开访问地址"><Globe2 :size="18" /></a><button class="icon-button" title="立即测活" :disabled="isProbing === selectedServer.id" @click="probe(selectedServer)"><RefreshCw :size="18" :class="{ spinning: isProbing === selectedServer.id }" /></button><button v-if="selectedServer.sshUser === 'root' && !emergencyRootActive(selectedServer)" class="danger-button" :disabled="isRootAction || isSessionAction" @click="enableRootAndOpenSession(selectedServer)"><ShieldCheck :size="16" /> 启用 root 并开启会话</button><button v-else-if="!selectedServerSession" class="secondary-button" :disabled="isSessionAction" @click="openAiSession(selectedServer)"><ShieldCheck :size="16" /> 开启会话</button><button v-else class="secondary-button" :disabled="isSessionAction" @click="closeAiSession"><X :size="16" /> 释放会话</button><button v-if="selectedServer.sshUser === 'root' && emergencyRootActive(selectedServer)" class="icon-button" title="关闭 root 访问" :disabled="isRootAction" @click="revokeEmergencyRoot(selectedServer)"><ShieldCheck :size="17" /></button><button class="secondary-button" @click="openEdit(selectedServer)">编辑</button><button class="danger-button" @click="archive(selectedServer)"><Archive :size="16" /> 归档</button></div>
           </section>
           <div class="detail-grid">
             <section class="panel health-panel"><div class="panel-heading"><div><h2>健康检查</h2><p>{{ humanTime(selectedServer.lastCheckedAt) }}</p></div><Activity :size="20" /></div><div v-if="selected?.events.length" class="probe-list"><div v-for="result in selected.events[0].results" :key="`${selected.events[0].id}-${result.name}`" class="probe-item"><span :class="['status-dot', result.ok ? 'healthy' : 'offline']"></span><span><strong>{{ result.name }}</strong><small>{{ result.detail }}</small></span><em>{{ result.latencyMs }} ms</em></div></div><div v-else class="empty-inline">尚无测活记录</div></section>
-            <section class="panel metrics-panel"><div class="panel-heading"><div><h2>性能</h2><p>{{ selected?.metric ? humanTime(selected.metric.collectedAt) : '尚未采集' }}</p></div><div class="panel-heading-actions"><button class="mini-icon" title="采集当前性能" :disabled="isCollectingMetrics" @click="collectMetrics(selectedServer)"><RefreshCw :size="15" :class="{ spinning: isCollectingMetrics }" /></button><Gauge :size="20" /></div></div><div v-if="selected?.metric" class="metric-grid"><div><span>CPU</span><strong>{{ selected.metric.cpuPercent ?? '—' }}<small v-if="selected.metric.cpuPercent !== null">%</small></strong></div><div><span>内存</span><strong>{{ selected.metric.memoryPercent ?? '—' }}<small v-if="selected.metric.memoryPercent !== null">%</small></strong></div><div><span>磁盘</span><strong>{{ selected.metric.diskPercent ?? '—' }}<small v-if="selected.metric.diskPercent !== null">%</small></strong></div><div><span>Load 1m</span><strong>{{ selected.metric.load1 ?? '—' }}</strong></div></div><div v-if="selected?.metric?.note" class="metric-note"><CircleAlert :size="15" /> {{ selected.metric.note }}</div><div v-else-if="!selected?.metric" class="empty-inline">采集的是当前快照，不安装 Agent，也不会读取当前目录中的私钥。</div></section>
+            <section class="panel metrics-panel"><div class="panel-heading"><div><h2>性能</h2><p>{{ selected?.metric ? humanTime(selected.metric.collectedAt) : '尚未采集' }}</p></div><div class="panel-heading-actions"><button class="mini-icon" title="采集当前性能" :disabled="isCollectingMetrics" @click="collectMetrics(selectedServer)"><RefreshCw :size="15" :class="{ spinning: isCollectingMetrics }" /></button><Gauge :size="20" /></div></div><div v-if="selected?.metric" class="metric-grid"><div><span>CPU</span><strong>{{ selected.metric.cpuPercent ?? '—' }}<small v-if="selected.metric.cpuPercent !== null">%</small></strong></div><div><span>内存</span><strong>{{ selected.metric.memoryPercent ?? '—' }}<small v-if="selected.metric.memoryPercent !== null">%</small></strong></div><div><span>磁盘</span><strong>{{ selected.metric.diskPercent ?? '—' }}<small v-if="selected.metric.diskPercent !== null">%</small></strong></div><div><span>Load 1m</span><strong>{{ selected.metric.load1 ?? '—' }}</strong></div></div><div v-if="metricNoteFor(selectedServer)" class="metric-note"><CircleAlert :size="15" /> {{ metricNoteFor(selectedServer) }}</div><div v-else-if="!selected?.metric" class="empty-inline">采集的是当前快照，不安装 Agent，也不会读取当前目录中的私钥。</div></section>
             <section class="panel session-panel"><div class="panel-heading"><div><h2>AI 会话租约</h2><p>同一 VPS 同时只允许一个执行会话</p></div><ShieldCheck :size="20" /></div><div v-if="selectedServerSession" class="session-summary"><div class="session-summary-top"><span :class="['status-badge', sessionStatusOf(selectedServerSession.status).tone]">{{ sessionStatusOf(selectedServerSession.status).label }}</span><strong>{{ selectedServerSession.requester }}</strong><small v-if="selectedServerSession.status === 'queued'">排队第 {{ selectedServerSession.queuePosition }} 位</small></div><dl class="property-list"><div><dt>空闲释放</dt><dd>{{ selectedServerSession.idleExpiresAt ? humanTime(selectedServerSession.idleExpiresAt) : '获得租约后开始' }}</dd></div><div><dt>最长租期</dt><dd>{{ humanTime(selectedServerSession.maxExpiresAt) }}</dd></div><div><dt>会话 ID</dt><dd class="mono-value">{{ selectedServerSession.id }}</dd></div></dl><div v-if="selectedSession?.commands.length" class="session-command-list"><div v-for="command in selectedSession.commands.slice(0, 5)" :key="command.id"><span :class="['risk-label', command.risk]">{{ commandRiskLabel(command.risk) }}</span><code>{{ command.command }}</code><small>{{ commandOutcomeLabel(command.outcome) }} · {{ humanTime(command.createdAt) }}</small></div></div></div><div v-else class="empty-inline">当前没有占用或排队中的 AI 会话</div></section>
-            <section class="panel inventory-panel"><div class="panel-heading"><div><h2>连接资料</h2><p>仅保存引用，不保存秘密</p></div><Terminal :size="20" /></div><dl class="property-list"><div><dt>环境</dt><dd>{{ selectedServer.environment }}</dd></div><div><dt>数据来源</dt><dd>{{ selectedServer.source === 'all-vps' ? 'all-vps 文档同步' : '手动登记' }}</dd></div><div><dt>凭据引用</dt><dd>{{ selectedServer.credentialRef ?? '未关联' }}</dd></div><div v-if="selectedServer.sshUser === 'root'"><dt>root 救援</dt><dd :class="emergencyRootActive(selectedServer) ? 'root-grant-active' : 'root-grant-missing'">{{ emergencyRootActive(selectedServer) ? `有效至 ${humanTime(selectedServer.emergencyRootUntil)}` : '未开启，需 WebUI 显式开启' }}</dd></div><div><dt>标签</dt><dd><span v-if="selectedServer.tags.length" class="tag-list"><b v-for="tag in selectedServer.tags" :key="tag">{{ tag }}</b></span><span v-else>无</span></dd></div><div><dt>维护状态</dt><dd>{{ selectedServer.maintenance ? '已开启' : '正常' }}</dd></div></dl></section>
+            <section class="panel inventory-panel"><div class="panel-heading"><div><h2>连接资料</h2><p>仅保存引用，不保存秘密</p></div><Terminal :size="20" /></div><dl class="property-list"><div><dt>环境</dt><dd>{{ selectedServer.environment }}</dd></div><div><dt>数据来源</dt><dd>{{ selectedServer.source === 'all-vps' ? 'all-vps 文档同步' : '手动登记' }}</dd></div><div><dt>凭据引用</dt><dd>{{ selectedServer.credentialRef ?? '未关联' }}</dd></div><div v-if="selectedServer.sshUser === 'root'"><dt>root 访问</dt><dd :class="emergencyRootActive(selectedServer) ? 'root-grant-active' : 'root-grant-missing'">{{ emergencyRootActive(selectedServer) ? `有效至 ${humanTime(selectedServer.emergencyRootUntil)}` : '未启用，点击上方按钮可启用 8 小时' }}</dd></div><div><dt>标签</dt><dd><span v-if="selectedServer.tags.length" class="tag-list"><b v-for="tag in selectedServer.tags" :key="tag">{{ tag }}</b></span><span v-else>无</span></dd></div><div><dt>维护状态</dt><dd>{{ selectedServer.maintenance ? '已开启' : '正常' }}</dd></div></dl></section>
             <section class="panel history-panel"><div class="panel-heading"><div><h2>健康历史</h2><p>最近 {{ selected?.events.length ?? 0 }} 次</p></div><Clock3 :size="20" /></div><div v-if="selected?.events.length" class="timeline"><div v-for="event in selected.events.slice(0, 8)" :key="event.id"><span :class="['status-dot', statusOf(event.status).tone]"></span><strong>{{ statusOf(event.status).label }}</strong><time>{{ humanTime(event.checkedAt) }}</time><p v-if="event.error">{{ event.error }}</p></div></div><div v-else class="empty-inline">尚无健康历史</div></section>
           </div>
         </template>

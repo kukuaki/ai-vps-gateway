@@ -144,8 +144,9 @@ const commandSchema = z.object({
 });
 const sessionCloseSchema = z.object({ reason: z.string().trim().min(1).max(120).optional() });
 const metricsSchema = z.object({ sessionId: z.string().uuid().optional() });
+export const DEFAULT_ROOT_ACCESS_DURATION_MS = 8 * 60 * 60_000;
 const emergencyRootSchema = z.object({
-  durationMs: z.number().int().min(5 * 60_000).max(2 * 60 * 60_000).default(30 * 60_000)
+  durationMs: z.number().int().min(5 * 60_000).max(DEFAULT_ROOT_ACCESS_DURATION_MS).default(DEFAULT_ROOT_ACCESS_DURATION_MS)
 });
 
 function validationError(reply: { code: (status: number) => { send: (payload: unknown) => unknown } }, issues: z.ZodIssue[]): unknown {

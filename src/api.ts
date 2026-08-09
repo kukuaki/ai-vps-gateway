@@ -17,12 +17,13 @@ interface ApiErrorPayload {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = {
+    ...(init?.body === undefined ? {} : { "content-type": "application/json" }),
+    ...(init?.headers ?? {})
+  };
   const response = await fetch(path, {
     ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(init?.headers ?? {})
-    }
+    headers
   });
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as ApiErrorPayload;
@@ -39,7 +40,7 @@ export const api = {
   updateServer: (id: string, payload: ServerPayload) =>
     request<{ server: ServerRecord }>(`/api/servers/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   probeServer: (id: string) => request<{ server: ServerRecord }>(`/api/servers/${id}/probe`, { method: "POST" }),
-  grantEmergencyRoot: (id: string, durationMs = 30 * 60_000) => request<{ server: ServerRecord }>(`/api/servers/${id}/emergency-root`, { method: "POST", body: JSON.stringify({ durationMs }) }),
+  grantEmergencyRoot: (id: string, durationMs = 8 * 60 * 60_000) => request<{ server: ServerRecord }>(`/api/servers/${id}/emergency-root`, { method: "POST", body: JSON.stringify({ durationMs }) }),
   revokeEmergencyRoot: (id: string) => request<{ server: ServerRecord }>(`/api/servers/${id}/emergency-root/revoke`, { method: "POST" }),
   archiveServer: (id: string) => request<{ archived: boolean }>(`/api/servers/${id}/archive`, { method: "POST" }),
   sessions: () => request<{ sessions: SessionRecord[] }>("/api/sessions"),

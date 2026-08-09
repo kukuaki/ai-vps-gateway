@@ -14,7 +14,7 @@
 - 默认只绑定 `127.0.0.1` 的 Vue WebUI。
 - 供 Codex、Claude Code 使用的本机 stdio MCP 网关：读取可直接执行，远程命令必须先申请独占会话。
 
-网关刻意不读取、导入、上传或暴露私钥内容。Node 只解析逻辑凭据引用，由本机 `ssh` 进程从网关凭据目录读取密钥文件。
+网关刻意不读取、上传或暴露私钥内容。Node 只解析逻辑凭据引用，由本机 `ssh` 进程从网关凭据目录读取密钥文件；显式导入命令仅执行本机文件复制，不解析密钥字节。
 
 ## 安全边界
 
@@ -22,7 +22,7 @@
 - WebUI 与 API 默认仅本机可访问。
 - MCP 命令执行只允许从本机发起，并且必须经过会话租约：同一 VPS 同时只有一个活动会话，后续请求排队；默认空闲 30 分钟释放，最长 8 小时。
 - 高危命令会以 warning/critical 写入审计。少数不可逆命令会直接阻断，包括常见的根目录递归删除、文件系统格式化、块设备写入和 fork bomb 形式；这是一层保底规则，不是完整 Shell 沙箱。
-- SSH 用户是 `root` 的 VPS，必须先由 WebUI 开启限时紧急 root 救援；默认有效 30 分钟，开启、过期和关闭都会审计。
+- SSH 用户是 `root` 的 VPS，由 WebUI 一次点击启用 8 小时 root 访问并开启会话；有效期内 AI 不需要逐命令或逐会话再次确认，开启、过期和关闭都会审计。
 - 命令和输出在保存前脱敏，默认保存 90 天后清理；资产、项目摘要和审计事件继续保存在本机 SQLite。
 - ICMP Ping 失败不会直接判定 VPS 离线；SSH/TCP 和项目健康检查才是主判断依据。
 - `all-vps` 同步不会读取私钥，并会保留本机凭据引用和紧急 root 状态。
@@ -85,6 +85,17 @@ npm run sync:all-vps
 
 同步以 SSH 地址和端口建立稳定标识，并会更新名称、SSH 登录信息、用途、标签、访问地址与 HTTP 健康检查。本机的凭据引用和维护状态会保留。清单中已移除的资产只会在预览中提示，不会被自动归档。WebUI 应用同步时会校验预览摘要，文档发生变化后必须重新预览。
 
+## 导入 all-vps 凭据
+
+该命令是显式本机操作，不属于 Markdown 同步。它只在 `all-vps` 顶层查找文件名包含已登记 VPS 地址的 `.key` 或 `.pem`，每台服务器必须唯一匹配；不会读取、打印或上传密钥内容，也不会删除源文件、覆盖已有引用或覆盖网关中的同名文件。
+
+```bash
+npm run import:all-vps-credentials -- --dry-run
+npm run import:all-vps-credentials
+```
+
+导入后的副本存放于 `~/Library/Application Support/AI VPS Gateway/credentials/`，目录权限为 `0700`，文件权限为 `0600`。数据库只记录逻辑文件名。
+
 ## MCP
 
 先启动本机 API，再把 stdio 适配器注册到客户端：
@@ -102,7 +113,7 @@ npm run sync:all-vps
 
 当前提供：`list_servers`、`get_server`、`get_dashboard`、`list_projects`、`get_project`、`list_sessions`、`open_session`、`get_session`、`run_command`、`close_session`、`collect_metrics`。
 
-正常执行流程是：先 `open_session`，如果返回排队就等待，再通过 `run_command` 执行，必要时使用 `collect_metrics` 获取当前性能，完成后 `close_session`。API 和 MCP 适配器默认只绑定 `127.0.0.1`，AI 不会拿到私钥或任意本机 SSH 路径。
+正常执行流程是：先 `open_session`，如果返回排队就等待，再通过 `run_command` 执行，必要时使用 `collect_metrics` 获取当前性能，完成后 `close_session`。root VPS 由 WebUI 启用一次 8 小时访问窗口；窗口内流程与普通 VPS 相同。API 和 MCP 适配器默认只绑定 `127.0.0.1`，AI 不会拿到私钥或任意本机 SSH 路径。
 
 项目 Runbook 分为项目概览、部署步骤、验证步骤、排错手册和变更边界五部分。当前保存在本机 SQLite，供后续 AI 会话通过只读 MCP 查询；不要在 Runbook 中写入密码、Token、私钥或完整环境变量。
 

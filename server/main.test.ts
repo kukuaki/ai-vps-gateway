@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildApp } from "./main.js";
+import { buildApp, DEFAULT_ROOT_ACCESS_DURATION_MS } from "./main.js";
 import { GatewayDatabase } from "./db.js";
 
 const temporaryDirectories: string[] = [];
@@ -159,10 +159,12 @@ describe("local API", () => {
     const grantResponse = await app.inject({
       method: "POST",
       url: `/api/servers/${server.server.id}/emergency-root`,
-      payload: { durationMs: 300_000 }
+      payload: {}
     });
     assert.equal(grantResponse.statusCode, 200);
-    assert.ok(grantResponse.json().server.emergencyRootUntil);
+    const grantedUntil = grantResponse.json().server.emergencyRootUntil as string;
+    assert.ok(grantedUntil);
+    assert.ok(Date.parse(grantedUntil) - Date.now() > DEFAULT_ROOT_ACCESS_DURATION_MS - 60_000);
 
     const revokeResponse = await app.inject({ method: "POST", url: `/api/servers/${server.server.id}/emergency-root/revoke` });
     assert.equal(revokeResponse.statusCode, 200);

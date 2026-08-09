@@ -14,7 +14,7 @@ Local-first VPS inventory, health monitoring, and MCP gateway for personal AI-as
 - A local Vue WebUI bound to `127.0.0.1`.
 - A local stdio MCP gateway for Codex and Claude Code. Read operations are available immediately; remote commands require an exclusive gateway session.
 
-The gateway deliberately does **not** read, import, upload, or expose private key contents. Node resolves only a logical credential reference and lets the local `ssh` process read a key file from the gateway-owned credential directory.
+The gateway deliberately does **not** read, upload, or expose private key contents. Node resolves only a logical credential reference and lets the local `ssh` process read a key file from the gateway-owned credential directory; the explicit importer performs an opaque local file copy without parsing key bytes.
 
 ## Security model
 
@@ -22,7 +22,7 @@ The gateway deliberately does **not** read, import, upload, or expose private ke
 - The WebUI and API are loopback-only by default.
 - MCP command execution is loopback-only and lease-based: one VPS has one active session, later sessions queue, idle sessions expire after 30 minutes, and every session has an eight-hour maximum by default.
 - High-risk commands are recorded with a warning severity. A small absolute denylist blocks common root-directory recursive deletion, filesystem formatting, block-device writes, and fork-bomb patterns. This is a guardrail, not a complete shell sandbox.
-- VPS records whose SSH user is `root` require a time-limited emergency-root grant from the WebUI. The grant is audited and expires by default after 30 minutes.
+- VPS records whose SSH user is `root` are enabled once from the WebUI for an eight-hour root-access window and a session is opened immediately. No per-command or per-session confirmation is required during that window; enabling, expiry, and revocation are audited.
 - Command text and output are redacted before persistence and command records are pruned after 90 days by default. Asset/project summaries and audit events remain in local SQLite.
 - A failed ICMP ping does not mark a VPS offline. SSH/TCP and configured service probes are authoritative.
 - The `all-vps` synchronizer never reads private keys. Its sync operation preserves the local credential reference and emergency-root state.
@@ -85,6 +85,17 @@ Set `ALLVPS_SOURCE_DIR` to use another local directory. The synchronizer reads o
 
 Synchronization identifies an asset by SSH address and port, then updates documented identity, SSH login metadata, role, tags, access URL, and HTTP health checks. Local credential references and maintenance state are preserved. Assets removed from the source documents are shown in the preview and are never automatically archived. The WebUI validates the preview digest before applying a sync, so a changed source must be previewed again.
 
+## Importing all-vps Credentials
+
+This explicit local command is separate from Markdown synchronization. It only examines top-level `.key` and `.pem` filenames containing a registered VPS address, and requires exactly one match per VPS. It does not read, print, or upload key contents, delete the source file, overwrite an existing reference, or overwrite an existing gateway credential file.
+
+```bash
+npm run import:all-vps-credentials -- --dry-run
+npm run import:all-vps-credentials
+```
+
+Imported copies are placed in `~/Library/Application Support/AI VPS Gateway/credentials/` with directory mode `0700` and file mode `0600`. The database stores only the logical filename.
+
 ## MCP
 
 Start the local API first, then register the stdio adapter with your client:
@@ -102,7 +113,7 @@ Start the local API first, then register the stdio adapter with your client:
 
 Available tools include `list_servers`, `get_server`, `get_dashboard`, `list_projects`, `get_project`, `list_sessions`, `open_session`, `get_session`, `run_command`, `close_session`, and `collect_metrics`.
 
-The normal execution flow is: open a session, wait if it is queued, run commands through `run_command`, collect current metrics when needed, then close the session. The API and MCP adapter remain bound to `127.0.0.1`; the AI client receives neither a private key nor an unrestricted local SSH path.
+The normal execution flow is: open a session, wait if it is queued, run commands through `run_command`, collect current metrics when needed, then close the session. A root VPS receives one eight-hour access window from the WebUI, then follows the same flow. The API and MCP adapter remain bound to `127.0.0.1`; the AI client receives neither a private key nor an unrestricted local SSH path.
 
 Each project runbook has five sections: overview, deployment, verification, troubleshooting, and guardrails. It is stored in local SQLite and exposed to later AI sessions through read-only MCP queries. Do not put passwords, tokens, private keys, or complete environment variables in a runbook.
 

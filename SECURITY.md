@@ -9,7 +9,7 @@ AI VPS Gateway is designed for a single local operator. It binds its API to
 
 - Do not commit private keys, tokens, passwords, `.env` files, database dumps,
   or SSH configuration containing secrets.
-- The gateway does not import or read private key contents. It validates only the metadata and permissions of a logical credential reference, then passes the restricted path to the local `ssh` process.
+- The gateway does not read private key contents. Its explicit local importer copies an opaque, uniquely address-matched `.key` or `.pem` file into the protected credential directory without parsing or exposing its bytes. SSH validates the logical reference and reads the file only during a gateway session.
 - The optional `all-vps` synchronizer reads only `VPS_INVENTORY.md` and `DOMAINS.md` from its configured source directory. It does not enumerate files or read `.key` files.
 - Project runbooks are local operational notes. Keep passwords, tokens, private keys,
   complete environment variables, and sensitive business data out of them.
@@ -17,8 +17,9 @@ AI VPS Gateway is designed for a single local operator. It binds its API to
   set to `0600`.
 - Remote commands require a per-VPS session lease. Command text and output are
   redacted before storage, with command records pruned after 90 days by default.
-- `root` SSH records require a time-limited WebUI emergency-root grant. The
-  grant, session, command, and expiry events are auditable.
+- `root` SSH records require one local WebUI action that enables an eight-hour
+  root-access window and opens a session. The grant, session, command, and
+  expiry events are auditable; individual commands do not require confirmation.
 - The command policy is a conservative denylist and warning layer. It is not a
   complete sandbox for arbitrary shell syntax or obfuscated commands.
 
