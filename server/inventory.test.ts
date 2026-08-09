@@ -53,4 +53,65 @@ describe("remote project inventory", () => {
     assert.equal(database.archiveMissingDiscoveredProjects(server.id, [discovered[0]!.sourceKey]), 1);
     database.close();
   });
+
+  it("separates a web application and S-UI while retaining stack, routes and port mappings", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-inventory-detailed-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "大阪主站", address: "203.0.113.71", sshPort: 22, sshUser: "ubuntu" });
+    const inventory = parseInventoryOutput(server.id, [
+      "__AI_VPS_GATEWAY_INVENTORY_V2__",
+      "META\thostname\tosaka-web-01",
+      "META\tos\tUbuntu 24.04",
+      "META\tdocker\tavailable",
+      "PROJECT\tnode\t/opt/zhongde/releases/20260809/package.json",
+      "CONTAINER_PACKAGE\tzongde-web\tzhongde-b2b-site\t@prisma/client,next,react,typescript,tailwindcss,pgvector,zod",
+      "SERVICE\tdocker\tzongde-web\tzhongde-web:20260809\trunning / health=healthy\t\t3000/tcp\t/opt/zhongde\tzongde\t/app\t/opt/zhongde/releases/current -> /app",
+      "SERVICE\tdocker\tzongde-nginx\tnginx:1.27-alpine\trunning\t80/tcp -> 0.0.0.0:80; 443/tcp -> 0.0.0.0:443\t80/tcp 443/tcp\t/opt/zhongde\tzongde\t\t/etc/zhongde/nginx -> /etc/nginx/conf.d",
+      "SERVICE\tdocker\tzongde-postgres\tpgvector/pgvector:pg16\trunning\t\t5432/tcp\t/opt/zhongde\tzongde\t\t/opt/zhongde/postgres -> /var/lib/postgresql/data",
+      "SERVICE\tdocker\ts-ui\talireza7/s-ui:latest\trunning\t2095/tcp -> 0.0.0.0:2095; 8388/tcp -> 0.0.0.0:8388\t2095/tcp 8388/tcp\t\ts-ui\t\t",
+      "WEB\tnginx\t/etc/zhongde/nginx/site.conf\tserver_name zongde.ltd www.zongde.ltd;",
+      "WEB\tnginx\t/etc/zhongde/nginx/site.conf\tlisten 443 ssl;",
+      "WEB\tnginx\t/etc/zhongde/nginx/site.conf\tproxy_pass http://zhongde-web:3100;",
+      "PORT\ttcp\t0.0.0.0:80",
+      "PORT\ttcp\t0.0.0.0:443",
+      ""
+    ].join("\n"));
+
+    const discovered = discoveredProjectsForInventory(server, inventory);
+    const zongde = discovered.find((project) => project.name === "大阪主站 · zongde");
+    const sui = discovered.find((project) => project.name === "大阪主站 · S-UI");
+    assert.ok(zongde);
+    assert.ok(sui);
+    assert.equal(zongde.services?.length, 3);
+    assert.deepEqual(zongde.webEndpoints, [
+      {
+        label: "www.zongde.ltd",
+        url: "https://www.zongde.ltd",
+        port: 443,
+        serviceName: "zongde-web",
+        notes: "上游：http://zhongde-web:3100；配置摘要：/etc/zhongde/nginx/site.conf",
+        source: "remote-inventory"
+      },
+      {
+        label: "zongde.ltd",
+        url: "https://zongde.ltd",
+        port: 443,
+        serviceName: "zongde-web",
+        notes: "上游：http://zhongde-web:3100；配置摘要：/etc/zhongde/nginx/site.conf",
+        source: "remote-inventory"
+      }
+    ]);
+    assert.ok(zongde.technologyStack?.includes("Next.js"));
+    assert.ok(zongde.technologyStack?.includes("pgvector"));
+    assert.ok(zongde.services?.some((service) => service.name === "zongde-nginx" && service.portMappings?.includes("443/tcp -> 0.0.0.0:443")));
+    assert.equal(sui.services?.length, 1);
+    assert.ok(sui.technologyStack?.includes("S-UI"));
+    assert.equal(sui.webEndpoints?.length, 0);
+    const saved = database.syncDiscoveredProject(zongde);
+    assert.deepEqual(saved.project.webEndpoints, zongde.webEndpoints);
+    assert.deepEqual(saved.project.technologyStack, zongde.technologyStack);
+    assert.ok(saved.project.services.some((service) => service.portMappings.includes("443/tcp -> 0.0.0.0:443")));
+    database.close();
+  });
 });

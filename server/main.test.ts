@@ -181,7 +181,7 @@ describe("local API", () => {
     await app.close();
   });
 
-  it("requires and records a WebUI emergency-root grant for root SSH assets", async () => {
+  it("records an optional WebUI emergency-root rescue marker for root SSH assets", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-root-"));
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);

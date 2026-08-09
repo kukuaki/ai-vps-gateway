@@ -291,7 +291,7 @@ server.registerTool(
   "list_projects",
   {
     title: "List project runbooks",
-    description: "读取本机项目档案摘要、关联 VPS 数量、服务数量和关键服务数量。不会执行远程命令。",
+    description: "读取本机项目档案摘要、技术栈、项目级 Web 入口、关联 VPS 数量、服务数量和关键服务数量。不会执行远程命令。",
     annotations: { readOnlyHint: true }
   },
   async () => {
@@ -307,7 +307,7 @@ server.registerTool(
   "get_project",
   {
     title: "Get project runbook",
-    description: "读取项目的 Runbook、关联 VPS、Docker/systemd/进程服务清单和变更边界。不会执行远程命令。",
+    description: "读取项目的技术栈、项目级 Web 入口、Runbook、关联 VPS、Docker/systemd/进程服务清单、端口映射、镜像/挂载备注和变更边界。不会执行远程命令。",
     inputSchema: { projectId: z.string().uuid().describe("AI VPS Gateway 中的项目 UUID") },
     annotations: { readOnlyHint: true }
   },

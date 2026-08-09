@@ -63,6 +63,7 @@ describe("all-vps document synchronization", () => {
     const application = database.listServers().find((server) => server.address === "203.0.113.10");
     assert.equal(application?.source, "all-vps");
     assert.equal(application?.credentialRef, null);
+    assert.equal(application?.networkMode, "direct");
 
     database.updateServer(application?.id as string, { credentialRef: "macos-keychain:application", maintenance: true });
     const secondSync = applyAllVpsSync(database, document);

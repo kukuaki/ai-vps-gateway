@@ -9,6 +9,7 @@ export interface HealthCheckConfig {
   port?: number;
   expectedStatusCodes?: number[];
   timeoutMs?: number;
+  networkMode?: SshNetworkMode;
 }
 
 export interface HealthCheck {
@@ -129,6 +130,8 @@ export interface RemoteInventoryProject {
   name: string;
   path: string;
   manifest: string;
+  technologyStack: string[];
+  webEndpoints: ProjectWebEndpoint[];
 }
 
 export interface RemoteInventoryService {
@@ -138,7 +141,22 @@ export interface RemoteInventoryService {
   status: string;
   image: string | null;
   ports: string | null;
+  portMappings: string[];
   projectPath: string | null;
+  projectHint: string | null;
+  workingDirectory: string | null;
+  mounts: string[];
+}
+
+export interface RemoteInventoryWebRoute {
+  source: string;
+  configPath: string;
+  hostnames: string[];
+  ports: number[];
+  upstream: string | null;
+  root: string | null;
+  serviceName: string | null;
+  projectHint: string | null;
 }
 
 export interface ServerInventory {
@@ -150,6 +168,7 @@ export interface ServerInventory {
   dockerAvailable: boolean;
   projects: RemoteInventoryProject[];
   services: RemoteInventoryService[];
+  webRoutes: RemoteInventoryWebRoute[];
   listeningPorts: string[];
   warnings: string[];
 }
@@ -227,6 +246,17 @@ export interface ServerPayload {
 
 export type ServiceManager = "docker" | "systemd" | "process" | "external";
 
+export type ProjectEndpointSource = "manual" | "remote-inventory";
+
+export interface ProjectWebEndpoint {
+  label: string;
+  url: string;
+  port: number | null;
+  serviceName: string | null;
+  notes: string;
+  source: ProjectEndpointSource;
+}
+
 export interface ProjectRunbook {
   overview: string;
   deployment: string;
@@ -253,6 +283,7 @@ export interface ProjectService {
   manager: ServiceManager;
   identifier: string;
   port: number | null;
+  portMappings: string[];
   accessUrl: string | null;
   critical: boolean;
   notes: string;
@@ -269,6 +300,8 @@ export interface ProjectRecord {
   description: string;
   repositoryUrl: string | null;
   repositoryPath: string | null;
+  technologyStack: string[];
+  webEndpoints: ProjectWebEndpoint[];
   archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -288,6 +321,8 @@ export interface ProjectPayload {
   description: string;
   repositoryUrl: string | null;
   repositoryPath: string | null;
+  technologyStack: string[];
+  webEndpoints: ProjectWebEndpoint[];
   runbook: ProjectRunbook;
   servers: Array<{ serverId: string; role: string }>;
   services: Array<{
@@ -296,6 +331,7 @@ export interface ProjectPayload {
     manager: ServiceManager;
     identifier: string;
     port: number | null;
+    portMappings: string[];
     accessUrl: string | null;
     critical: boolean;
     notes: string;

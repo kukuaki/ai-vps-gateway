@@ -26,6 +26,7 @@ import type {
   ProjectServerLink,
   ProjectService,
   ProjectServiceInput,
+  ProjectWebEndpoint,
   ProbeResult,
   ServerInventory,
   ServerRecord,
@@ -145,6 +146,8 @@ interface RawProject {
   description: string;
   repository_url: string | null;
   repository_path: string | null;
+  technology_stack_json: string;
+  web_endpoints_json: string;
   runbook_json: string;
   archived_at: string | null;
   created_at: string;
@@ -172,6 +175,7 @@ interface RawProjectService {
   manager: ServiceManager;
   identifier: string;
   port: number | null;
+  port_mappings_json: string;
   access_url: string | null;
   critical: number;
   notes: string;
@@ -239,6 +243,29 @@ function emptyRunbook(): ProjectRunbook {
   return { overview: "", deployment: "", verification: "", troubleshooting: "", guardrails: "" };
 }
 
+function normalizedStringList(values: string[] | undefined | null): string[] {
+  return [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
+}
+
+function normalizedWebEndpoints(values: ProjectWebEndpoint[] | undefined | null): ProjectWebEndpoint[] {
+  const endpoints = (values ?? [])
+    .map((endpoint) => ({
+      label: endpoint.label.trim().slice(0, 120),
+      url: endpoint.url.trim(),
+      port: endpoint.port ?? null,
+      serviceName: endpoint.serviceName?.trim() || null,
+      notes: endpoint.notes.trim().slice(0, 1_000),
+      source: (endpoint.source === "remote-inventory" ? "remote-inventory" : "manual") as ProjectWebEndpoint["source"]
+    }))
+    .filter((endpoint) => endpoint.url.length > 0);
+  const deduplicated = new Map<string, ProjectWebEndpoint>();
+  for (const endpoint of endpoints) {
+    const key = `${endpoint.url}\u0000${endpoint.serviceName ?? ""}`;
+    deduplicated.set(key, endpoint);
+  }
+  return [...deduplicated.values()].sort((left, right) => `${left.url}:${left.serviceName ?? ""}`.localeCompare(`${right.url}:${right.serviceName ?? ""}`));
+}
+
 function toRunbook(value: string): ProjectRunbook {
   const parsed = parseJson<Partial<ProjectRunbook>>(value, {});
   return {
@@ -299,6 +326,8 @@ function toProject(raw: RawProject): ProjectRecord {
     description: raw.description,
     repositoryUrl: raw.repository_url,
     repositoryPath: raw.repository_path,
+    technologyStack: normalizedStringList(parseJson<string[]>(raw.technology_stack_json ?? "[]", [])),
+    webEndpoints: normalizedWebEndpoints(parseJson<ProjectWebEndpoint[]>(raw.web_endpoints_json ?? "[]", [])),
     archivedAt: raw.archived_at,
     createdAt: raw.created_at,
     updatedAt: raw.updated_at,
@@ -465,6 +494,8 @@ export class GatewayDatabase {
         description TEXT NOT NULL DEFAULT '',
         repository_url TEXT,
         repository_path TEXT,
+        technology_stack_json TEXT NOT NULL DEFAULT '[]',
+        web_endpoints_json TEXT NOT NULL DEFAULT '[]',
         runbook_json TEXT NOT NULL DEFAULT '{}',
         archived_at TEXT,
         created_at TEXT NOT NULL,
@@ -486,6 +517,7 @@ export class GatewayDatabase {
         manager TEXT NOT NULL,
         identifier TEXT NOT NULL,
         port INTEGER,
+        port_mappings_json TEXT NOT NULL DEFAULT '[]',
         access_url TEXT,
         critical INTEGER NOT NULL DEFAULT 0,
         notes TEXT NOT NULL DEFAULT '',
@@ -504,6 +536,9 @@ export class GatewayDatabase {
     this.addProjectColumnIfMissing("source TEXT NOT NULL DEFAULT 'manual'");
     this.addProjectColumnIfMissing("source_key TEXT");
     this.addProjectColumnIfMissing("source_synced_at TEXT");
+    this.addProjectColumnIfMissing("technology_stack_json TEXT NOT NULL DEFAULT '[]'");
+    this.addProjectColumnIfMissing("web_endpoints_json TEXT NOT NULL DEFAULT '[]'");
+    this.addProjectServiceColumnIfMissing("port_mappings_json TEXT NOT NULL DEFAULT '[]'");
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_source_key
         ON servers(source_key) WHERE source_key IS NOT NULL;
@@ -545,6 +580,16 @@ export class GatewayDatabase {
   private addProjectColumnIfMissing(definition: string): void {
     try {
       this.db.exec(`ALTER TABLE projects ADD COLUMN ${definition}`);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes("duplicate column name")) {
+        throw error;
+      }
+    }
+  }
+
+  private addProjectServiceColumnIfMissing(definition: string): void {
+    try {
+      this.db.exec(`ALTER TABLE project_services ADD COLUMN ${definition}`);
     } catch (error) {
       if (!(error instanceof Error) || !error.message.includes("duplicate column name")) {
         throw error;
@@ -693,6 +738,7 @@ export class GatewayDatabase {
     if (existing.archivedAt) changes.push("恢复已归档资产");
     if (existing.name !== desired.name) changes.push("名称");
     if (existing.address !== desired.address || existing.sshPort !== desired.sshPort || existing.sshUser !== desired.sshUser) changes.push("SSH 连接");
+    if (existing.networkMode !== (desired.networkMode ?? "system")) changes.push("SSH 网络路径");
     if (existing.role !== (desired.role ?? "")) changes.push("用途 / 角色");
     if (existing.environment !== (desired.environment ?? "production")) changes.push("环境");
     if (existing.accessUrl !== (desired.accessUrl ?? null)) changes.push("访问地址");
@@ -753,7 +799,7 @@ export class GatewayDatabase {
     this.db
       .prepare(`
         UPDATE servers SET source = ?, source_key = ?, source_synced_at = ?, name = ?, address = ?, ssh_port = ?,
-          ssh_user = ?, role = ?, environment = ?, access_url = ?, tags_json = ?, archived_at = NULL,
+          ssh_user = ?, network_mode = ?, role = ?, environment = ?, access_url = ?, tags_json = ?, archived_at = NULL,
           status = CASE WHEN archived_at IS NULL THEN status ELSE 'unknown' END, updated_at = ? WHERE id = ?
       `)
       .run(
@@ -764,6 +810,7 @@ export class GatewayDatabase {
         desired.address,
         desired.sshPort,
         desired.sshUser,
+        desired.networkMode ?? "system",
         desired.role ?? "",
         desired.environment ?? "production",
         desired.accessUrl ?? null,
@@ -837,6 +884,7 @@ export class GatewayDatabase {
       manager: row.manager,
       identifier: row.identifier,
       port: row.port,
+      portMappings: normalizedStringList(parseJson<string[]>(row.port_mappings_json ?? "[]", [])),
       accessUrl: row.access_url,
       critical: row.critical === 1,
       notes: row.notes,
@@ -871,8 +919,8 @@ export class GatewayDatabase {
     this.db.prepare("DELETE FROM project_services WHERE project_id = ?").run(projectId);
     const insert = this.db.prepare(`
       INSERT INTO project_services
-        (id, project_id, server_id, name, manager, identifier, port, access_url, critical, notes, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, project_id, server_id, name, manager, identifier, port, port_mappings_json, access_url, critical, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const service of services) {
       insert.run(
@@ -883,6 +931,7 @@ export class GatewayDatabase {
         service.manager,
         service.identifier,
         service.port ?? null,
+        JSON.stringify(normalizedStringList(service.portMappings)),
         service.accessUrl ?? null,
         service.critical ? 1 : 0,
         service.notes ?? "",
@@ -1141,13 +1190,15 @@ export class GatewayDatabase {
     const runbook = input.runbook ?? emptyRunbook();
     const servers = input.servers ?? [];
     const services = input.services ?? [];
+    const technologyStack = normalizedStringList(input.technologyStack);
+    const webEndpoints = normalizedWebEndpoints(input.webEndpoints);
     this.assertProjectResources(servers, services);
     return this.transaction(() => {
       this.db
         .prepare(`
           INSERT INTO projects
-            (id, source, source_key, source_synced_at, name, description, repository_url, repository_path, runbook_json, created_at, updated_at)
-          VALUES (?, 'manual', NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+            (id, source, source_key, source_synced_at, name, description, repository_url, repository_path, technology_stack_json, web_endpoints_json, runbook_json, created_at, updated_at)
+          VALUES (?, 'manual', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           id,
@@ -1155,6 +1206,8 @@ export class GatewayDatabase {
           input.description ?? "",
           input.repositoryUrl ?? null,
           input.repositoryPath ?? null,
+          JSON.stringify(technologyStack),
+          JSON.stringify(webEndpoints),
           JSON.stringify(runbook),
           timestamp,
           timestamp
@@ -1175,16 +1228,19 @@ export class GatewayDatabase {
       manager: service.manager,
       identifier: service.identifier,
       port: service.port,
+      portMappings: service.portMappings,
       accessUrl: service.accessUrl,
       critical: service.critical,
       notes: service.notes
     }));
+    const nextTechnologyStack = patch.technologyStack === undefined ? existing.technologyStack : normalizedStringList(patch.technologyStack);
+    const nextWebEndpoints = patch.webEndpoints === undefined ? existing.webEndpoints : normalizedWebEndpoints(patch.webEndpoints);
     this.assertProjectResources(nextServers, nextServices);
     const timestamp = now();
     return this.transaction(() => {
       this.db
         .prepare(`
-          UPDATE projects SET name = ?, description = ?, repository_url = ?, repository_path = ?, runbook_json = ?,
+            UPDATE projects SET name = ?, description = ?, repository_url = ?, repository_path = ?, technology_stack_json = ?, web_endpoints_json = ?, runbook_json = ?,
             updated_at = ? WHERE id = ?
         `)
         .run(
@@ -1192,6 +1248,8 @@ export class GatewayDatabase {
           patch.description ?? existing.description,
           patch.repositoryUrl === undefined ? existing.repositoryUrl : patch.repositoryUrl,
           patch.repositoryPath === undefined ? existing.repositoryPath : patch.repositoryPath,
+          JSON.stringify(nextTechnologyStack),
+          JSON.stringify(nextWebEndpoints),
           JSON.stringify(patch.runbook ?? existing.runbook),
           timestamp,
           projectId
@@ -1205,6 +1263,8 @@ export class GatewayDatabase {
   syncDiscoveredProject(input: DiscoveredProjectInput): { action: InventorySyncAction; project: ProjectDetail } {
     const servers: ProjectServerInput[] = [{ serverId: input.serverId, role: "运行节点" }];
     const services = input.services ?? [];
+    const discoveredTechnologyStack = normalizedStringList(input.technologyStack);
+    const discoveredWebEndpoints = normalizedWebEndpoints(input.webEndpoints);
     this.assertProjectResources(servers, services);
     const existingRow = this.db
       .prepare("SELECT id FROM projects WHERE source = 'remote-inventory' AND source_key = ?")
@@ -1216,8 +1276,8 @@ export class GatewayDatabase {
         this.db
           .prepare(`
             INSERT INTO projects
-              (id, source, source_key, source_synced_at, name, description, repository_url, repository_path, runbook_json, created_at, updated_at)
-            VALUES (?, 'remote-inventory', ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+              (id, source, source_key, source_synced_at, name, description, repository_url, repository_path, technology_stack_json, web_endpoints_json, runbook_json, created_at, updated_at)
+            VALUES (?, 'remote-inventory', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
           `)
           .run(
             id,
@@ -1226,6 +1286,8 @@ export class GatewayDatabase {
             input.name,
             input.description,
             input.repositoryPath ?? null,
+            JSON.stringify(discoveredTechnologyStack),
+            JSON.stringify(discoveredWebEndpoints),
             JSON.stringify(input.runbook),
             timestamp,
             timestamp
@@ -1244,24 +1306,30 @@ export class GatewayDatabase {
       manager: service.manager,
       identifier: service.identifier,
       port: service.port,
+      portMappings: service.portMappings,
       accessUrl: service.accessUrl,
       critical: service.critical,
       notes: service.notes
-    }))) === JSON.stringify(services);
+    }))) === JSON.stringify(services.map((service) => ({ ...service, portMappings: normalizedStringList(service.portMappings) })));
+    const preservedManualEndpoints = existing.webEndpoints.filter((endpoint) => endpoint.source === "manual");
+    const nextWebEndpoints = normalizedWebEndpoints([...preservedManualEndpoints, ...discoveredWebEndpoints]);
+    const nextTechnologyStack = normalizedStringList([...existing.technologyStack, ...discoveredTechnologyStack]);
     const unchanged = existing.name === input.name &&
       existing.description === input.description &&
       existing.repositoryPath === (input.repositoryPath ?? null) &&
       JSON.stringify(existing.runbook) === JSON.stringify(input.runbook) &&
+      JSON.stringify(existing.technologyStack) === JSON.stringify(nextTechnologyStack) &&
+      JSON.stringify(existing.webEndpoints) === JSON.stringify(nextWebEndpoints) &&
       sameServices &&
       existing.archivedAt === null;
 
     this.transaction(() => {
       this.db
         .prepare(`
-          UPDATE projects SET source_synced_at = ?, name = ?, description = ?, repository_path = ?, runbook_json = ?,
+            UPDATE projects SET source_synced_at = ?, name = ?, description = ?, repository_path = ?, technology_stack_json = ?, web_endpoints_json = ?, runbook_json = ?,
             archived_at = NULL, updated_at = ? WHERE id = ?
-        `)
-        .run(timestamp, input.name, input.description, input.repositoryPath ?? null, JSON.stringify(input.runbook), timestamp, existing.id);
+          `)
+        .run(timestamp, input.name, input.description, input.repositoryPath ?? null, JSON.stringify(nextTechnologyStack), JSON.stringify(nextWebEndpoints), JSON.stringify(input.runbook), timestamp, existing.id);
       this.replaceProjectServers(existing.id, servers);
       this.replaceProjectServices(existing.id, services, timestamp);
     });
@@ -1297,6 +1365,10 @@ export class GatewayDatabase {
       .prepare("UPDATE servers SET archived_at = ?, status = 'archived', updated_at = ? WHERE id = ? AND archived_at IS NULL")
       .run(timestamp, timestamp, serverId);
     return result.changes > 0;
+  }
+
+  clearServerAccessUrl(serverId: string): void {
+    this.db.prepare("UPDATE servers SET access_url = NULL, updated_at = ? WHERE id = ? AND access_url IS NOT NULL").run(now(), serverId);
   }
 
   grantEmergencyRoot(serverId: string, durationMs: number): ServerRecord | null {

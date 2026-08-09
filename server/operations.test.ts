@@ -124,6 +124,44 @@ load1=0.42
     database.close();
   });
 
+  it("allows a registered root SSH asset without a rescue marker", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-root-operations-"));
+    temporaryDirectories.push(directory);
+    const credentials = join(directory, "credentials");
+    const key = join(credentials, "root-key");
+    const knownHosts = join(directory, "known_hosts");
+    mkdirSync(credentials);
+    writeFileSync(key, "test");
+    writeFileSync(knownHosts, "[203.0.113.54]:22 ssh-ed25519 test\n");
+    const store = new CredentialStore(credentials, knownHosts);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({
+      name: "root 直连节点",
+      address: "203.0.113.54",
+      sshPort: 22,
+      sshUser: "root",
+      credentialRef: "root-key"
+    });
+    const operations = new GatewayOperations(database, {
+      sshExecutor: new SshExecutor({ credentialStore: store, sshBinary: fakeSsh(directory), timeoutMs: 5_000 }),
+      idleTimeoutMs: 60_000,
+      maxSessionDurationMs: 600_000
+    });
+
+    const session = operations.openSession(server.id, "codex");
+    assert.equal(session.status, "active");
+    assert.equal(database.emergencyRootActive(server.id), false);
+    const command = await operations.runCommand(session.id, "printf ok");
+    assert.equal(command.outcome, "completed");
+    const metric = await operations.collectMetrics(server.id, session.id);
+    assert.equal(metric.source, "ssh");
+
+    database.grantEmergencyRoot(server.id, 60_000);
+    operations.revokeEmergencyRoot(server.id);
+    assert.equal(database.getSession(session.id, 60_000)?.status, "active");
+    database.close();
+  });
+
   it("returns unavailable metrics and rejects sessions when no credential is configured", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-no-credential-"));
     temporaryDirectories.push(directory);

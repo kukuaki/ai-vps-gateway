@@ -168,21 +168,6 @@ export class GatewayOperations {
 
   reconcile(): void {
     this.database.reconcileSessions(this.idleTimeoutMs);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const session of this.database.listActiveSessions(this.idleTimeoutMs)) {
-        const server = this.database.getServer(session.serverId);
-        if (session.status !== "active" || server?.sshUser !== "root" || this.database.emergencyRootActive(session.serverId)) continue;
-        const closed = this.database.closeSession(session.id, this.idleTimeoutMs, "emergency_root_expired");
-        if (closed) {
-          changed = true;
-          this.database.audit("session.root_expired", "session", session.id, `紧急 root 授权已过期：${server.name}`, "critical", {
-            serverId: server.id
-          });
-        }
-      }
-    }
     this.database.pruneCommandRuns(new Date(Date.now() - this.commandRetentionMs).toISOString());
     this.database.pruneMetrics(new Date(Date.now() - this.metricRetentionMs).toISOString());
   }
@@ -198,9 +183,6 @@ export class GatewayOperations {
   openSession(serverId: string, requester?: string): SessionRecord {
     const server = this.database.getServer(serverId);
     if (!server) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
-    if (server.sshUser === "root" && !this.database.emergencyRootActive(server.id)) {
-      throw new GatewayOperationError(409, "EmergencyRootRequired", "这台 VPS 使用 root SSH 登录，请先在 WebUI 开启限时紧急 root 救援");
-    }
     try {
       this.ssh.credentialStore.pathFor(server);
     } catch (error) {
@@ -245,17 +227,10 @@ export class GatewayOperations {
     if (!server) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
     const updated = this.database.revokeEmergencyRoot(serverId);
     if (!updated) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const session of this.database.listActiveSessions(this.idleTimeoutMs).filter((item) => item.serverId === serverId)) {
-        const closed = this.database.closeSession(session.id, this.idleTimeoutMs, "emergency_root_revoked");
-        if (!closed) continue;
-        changed = true;
-        this.database.audit("session.root_revoked", "session", session.id, `紧急 root 已撤销，会话已结束：${server.name}`, "critical", { serverId });
-      }
-    }
-    this.database.audit("server.emergency_root.revoked", "server", serverId, `关闭紧急 root 救援：${server.name}`, "critical");
+    this.database.audit("server.emergency_root.revoked", "server", serverId, `关闭 root 救援提示：${server.name}`, "warning", {
+      serverId,
+      sessionsRemainUsable: true
+    });
     return updated;
   }
 
@@ -269,13 +244,6 @@ export class GatewayOperations {
     }
     const server = this.database.getServer(session.serverId);
     if (!server) throw new GatewayOperationError(404, "NotFound", "会话对应的 VPS 不存在");
-    if (server.sshUser === "root" && !this.database.emergencyRootActive(server.id)) {
-      this.database.closeSession(sessionId, this.idleTimeoutMs, "emergency_root_expired");
-      this.database.audit("session.root_expired", "session", sessionId, `紧急 root 授权已过期：${server.name}`, "critical", {
-        serverId: server.id
-      });
-      throw new GatewayOperationError(409, "EmergencyRootExpired", "紧急 root 授权已过期，会话已结束");
-    }
     const assessment = assessCommand(command);
     const safeCommand = displayCommand(command);
     const createdAt = new Date().toISOString();
@@ -370,18 +338,11 @@ export class GatewayOperations {
       const session = this.database.getSession(sessionId, this.idleTimeoutMs);
       if (!session || session.serverId !== serverId) throw new GatewayOperationError(409, "SessionMismatch", "会话与 VPS 不匹配");
       if (session.status !== "active") throw new GatewayOperationError(409, "SessionNotActive", "会话尚未获得 VPS 租约", { session });
-      if (server.sshUser === "root" && !this.database.emergencyRootActive(server.id)) {
-        this.database.closeSession(sessionId, this.idleTimeoutMs, "emergency_root_expired");
-        throw new GatewayOperationError(409, "EmergencyRootExpired", "紧急 root 授权已过期，会话已结束");
-      }
       if (!this.database.touchActiveSession(sessionId, this.idleTimeoutMs)) {
         throw new GatewayOperationError(409, "SessionExpired", "会话已过期，不能采集性能");
       }
     } else {
       try {
-        if (server.sshUser === "root" && !this.database.emergencyRootActive(server.id)) {
-          throw new Error("这台 VPS 使用 root SSH 登录，请先在 WebUI 开启限时紧急 root 救援");
-        }
         this.ssh.credentialStore.pathFor(server);
         if (!this.ssh.credentialStore.hasKnownHosts()) throw new Error("本机没有可用的 SSH known_hosts");
       } catch (error) {
@@ -444,18 +405,11 @@ export class GatewayOperations {
       const session = this.database.getSession(sessionId, this.idleTimeoutMs);
       if (!session || session.serverId !== serverId) throw new GatewayOperationError(409, "SessionMismatch", "会话与 VPS 不匹配");
       if (session.status !== "active") throw new GatewayOperationError(409, "SessionNotActive", "会话尚未获得 VPS 租约", { session });
-      if (server.sshUser === "root" && !this.database.emergencyRootActive(server.id)) {
-        this.database.closeSession(sessionId, this.idleTimeoutMs, "emergency_root_expired");
-        throw new GatewayOperationError(409, "EmergencyRootExpired", "紧急 root 授权已过期，会话已结束");
-      }
       if (!this.database.touchActiveSession(sessionId, this.idleTimeoutMs)) {
         throw new GatewayOperationError(409, "SessionExpired", "会话已过期，不能盘点项目");
       }
     } else {
       try {
-        if (server.sshUser === "root" && !this.database.emergencyRootActive(server.id)) {
-          throw new Error("这台 VPS 使用 root SSH 登录，请先在 WebUI 开启限时紧急 root 救援");
-        }
         this.ssh.credentialStore.pathFor(server);
         if (!this.ssh.credentialStore.hasKnownHosts()) throw new Error("本机没有可用的 SSH known_hosts");
       } catch (error) {

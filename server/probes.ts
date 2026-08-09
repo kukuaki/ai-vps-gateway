@@ -136,8 +136,19 @@ export async function probeHttp(check: HealthCheck, localAddress?: string, conne
   }
 }
 
-async function runConfiguredCheck(check: HealthCheck, server: ServerRecord, localAddress?: string): Promise<ProbeResult> {
-  if (check.kind === "http") return probeHttp(check, localAddress, server.networkMode === "direct" ? server.address : undefined);
+export async function probeConfiguredHealthCheck(check: HealthCheck, server: ServerRecord): Promise<ProbeResult> {
+  const direct = check.config.networkMode === "direct";
+  const localAddress = direct ? directBindAddress() ?? undefined : undefined;
+  if (direct && !localAddress) {
+    return {
+      kind: check.kind,
+      name: check.name,
+      ok: false,
+      latencyMs: 0,
+      detail: "直连检查找不到物理网卡地址，请设置 ALLVPS_SSH_DIRECT_INTERFACE"
+    };
+  }
+  if (check.kind === "http") return probeHttp(check, localAddress, direct ? server.address : undefined);
   return probeTcp(check.config.host ?? server.address, check.config.port ?? server.sshPort, check.config.timeoutMs, localAddress).then((result) => ({ ...result, kind: "tcp", name: check.name }));
 }
 
@@ -186,7 +197,7 @@ export async function probeServer(database: GatewayDatabase, server: ServerRecor
     detail: "TCP 连接失败，跳过 SSH Banner"
   };
   const configuredChecks = server.healthChecks.filter((check) => check.enabled);
-  const serviceResults = await Promise.all(configuredChecks.map((check) => runConfiguredCheck(check, server, localAddress ?? undefined)));
+  const serviceResults = await Promise.all(configuredChecks.map((check) => probeConfiguredHealthCheck(check, server)));
   const results = [baselineTcp, baselineSsh, ...serviceResults];
   const status = statusFor(results, configuredChecks.length > 0);
   const failures = results.filter((result) => !result.ok).map((result) => `${result.name}: ${result.detail}`);

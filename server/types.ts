@@ -28,6 +28,7 @@ export interface HealthCheckConfig {
   port?: number;
   expectedStatusCodes?: number[];
   timeoutMs?: number;
+  networkMode?: SshNetworkMode;
 }
 
 export interface HealthCheck {
@@ -103,12 +104,25 @@ export interface ProjectServerInput {
   role?: string;
 }
 
+export const PROJECT_ENDPOINT_SOURCES = ["manual", "remote-inventory"] as const;
+export type ProjectEndpointSource = (typeof PROJECT_ENDPOINT_SOURCES)[number];
+
+export interface ProjectWebEndpoint {
+  label: string;
+  url: string;
+  port: number | null;
+  serviceName: string | null;
+  notes: string;
+  source: ProjectEndpointSource;
+}
+
 export interface ProjectServiceInput {
   serverId: string;
   name: string;
   manager: ServiceManager;
   identifier: string;
   port?: number | null;
+  portMappings?: string[];
   accessUrl?: string | null;
   critical?: boolean;
   notes?: string;
@@ -121,6 +135,8 @@ export interface DiscoveredProjectInput {
   repositoryPath?: string | null;
   serverId: string;
   runbook: ProjectRunbook;
+  technologyStack?: string[];
+  webEndpoints?: ProjectWebEndpoint[];
   services?: ProjectServiceInput[];
 }
 
@@ -130,6 +146,8 @@ export interface CreateProjectInput {
   repositoryUrl?: string | null;
   repositoryPath?: string | null;
   runbook?: ProjectRunbook;
+  technologyStack?: string[];
+  webEndpoints?: ProjectWebEndpoint[];
   servers?: ProjectServerInput[];
   services?: ProjectServiceInput[];
 }
@@ -145,6 +163,8 @@ export interface ProjectRecord {
   description: string;
   repositoryUrl: string | null;
   repositoryPath: string | null;
+  technologyStack: string[];
+  webEndpoints: ProjectWebEndpoint[];
   archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -171,6 +191,7 @@ export interface ProjectService {
   manager: ServiceManager;
   identifier: string;
   port: number | null;
+  portMappings: string[];
   accessUrl: string | null;
   critical: boolean;
   notes: string;
@@ -248,6 +269,8 @@ export interface RemoteInventoryProject {
   name: string;
   path: string;
   manifest: string;
+  technologyStack: string[];
+  webEndpoints: ProjectWebEndpoint[];
 }
 
 export interface RemoteInventoryService {
@@ -257,7 +280,22 @@ export interface RemoteInventoryService {
   status: string;
   image: string | null;
   ports: string | null;
+  portMappings: string[];
   projectPath: string | null;
+  projectHint: string | null;
+  workingDirectory: string | null;
+  mounts: string[];
+}
+
+export interface RemoteInventoryWebRoute {
+  source: string;
+  configPath: string;
+  hostnames: string[];
+  ports: number[];
+  upstream: string | null;
+  root: string | null;
+  serviceName: string | null;
+  projectHint: string | null;
 }
 
 export interface ServerInventory {
@@ -269,6 +307,7 @@ export interface ServerInventory {
   dockerAvailable: boolean;
   projects: RemoteInventoryProject[];
   services: RemoteInventoryService[];
+  webRoutes: RemoteInventoryWebRoute[];
   listeningPorts: string[];
   warnings: string[];
 }

@@ -1,16 +1,22 @@
 import { createServer as createTcpServer, type Server as TcpServer } from "node:net";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { probeHttp, probeSshBanner, probeTcp } from "./probes.js";
+import { GatewayDatabase } from "./db.js";
+import { probeConfiguredHealthCheck, probeHttp, probeSshBanner, probeTcp } from "./probes.js";
 
 const servers: TcpServer[] = [];
 const httpServers: HttpServer[] = [];
+const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(
     [...servers.splice(0), ...httpServers.splice(0)].map((server) => new Promise<void>((resolve) => server.close(() => resolve())))
   );
+  for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
 async function listen(handler: (socket: import("node:net").Socket) => void): Promise<number> {
@@ -92,5 +98,32 @@ describe("network probes", () => {
     }, undefined, "127.0.0.1");
     assert.equal(result.ok, true);
     assert.equal(result.statusCode, 200);
+  });
+
+  it("uses the system route for a public HTTP check by default even when SSH is direct", async () => {
+    const port = await listenHttp((_request, response) => {
+      response.writeHead(200);
+      response.end("ok");
+    });
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-probe-route-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({
+      name: "直连 SSH 节点",
+      address: "127.0.0.1",
+      sshPort: 22,
+      sshUser: "ubuntu",
+      networkMode: "direct"
+    });
+    const result = await probeConfiguredHealthCheck({
+      id: "public-route-check",
+      serverId: server.id,
+      name: "Public HTTP",
+      kind: "http",
+      enabled: true,
+      config: { url: `http://127.0.0.1:${port}/`, expectedStatusCodes: [200] }
+    }, server);
+    assert.equal(result.ok, true);
+    database.close();
   });
 });

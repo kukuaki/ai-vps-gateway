@@ -207,9 +207,12 @@ export function parseAllVpsDocuments(
       address: ssh.address,
       sshPort: ssh.sshPort,
       sshUser: ssh.sshUser,
+      // Gateway SSH must bypass local TUN/proxy routing by default. Operators can opt a manual asset back into system routing.
+      networkMode: "direct",
       role,
       environment: "production",
-      accessUrl: healthChecks[0]?.config.url ?? null,
+      // Web addresses belong to project records. A VPS can host multiple unrelated sites.
+      accessUrl: null,
       tags: tagsFor(role),
       maintenance: false,
       healthChecks

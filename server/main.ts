@@ -54,7 +54,8 @@ const healthCheckSchema = z
       host: hostSchema.optional(),
       port: z.number().int().min(1).max(65535).optional(),
       expectedStatusCodes: z.array(z.number().int().min(100).max(599)).max(12).optional(),
-      timeoutMs: z.number().int().min(250).max(10_000).optional()
+      timeoutMs: z.number().int().min(250).max(10_000).optional(),
+      networkMode: z.enum(["system", "direct"]).optional()
     })
   })
   .superRefine((value, context) => {
@@ -85,7 +86,7 @@ const createServerSchema = z.object({
   ...serverSchemaFields,
   sshPort: serverSchemaFields.sshPort.default(22),
   sshUser: serverSchemaFields.sshUser.default("root"),
-  networkMode: serverSchemaFields.networkMode.default("system"),
+  networkMode: serverSchemaFields.networkMode.default("direct"),
   credentialRef: serverSchemaFields.credentialRef.optional(),
   role: serverSchemaFields.role.default(""),
   environment: serverSchemaFields.environment.default("production"),
@@ -113,16 +114,28 @@ const projectServiceSchema = z.object({
   manager: z.enum(["docker", "systemd", "process", "external"]),
   identifier: z.string().trim().min(1).max(160).refine((value) => !/[\r\n]/.test(value), "服务标识不能包含换行"),
   port: z.number().int().min(1).max(65_535).nullable().optional(),
+  portMappings: z.array(z.string().trim().min(1).max(160)).max(40).default([]),
   accessUrl: z.string().url().nullable().optional(),
   critical: z.boolean().default(false),
   notes: z.string().trim().max(4_000).default("")
 });
+const projectWebEndpointSchema = z.object({
+  label: z.string().trim().min(1).max(120),
+  url: z.string().url(),
+  port: z.number().int().min(1).max(65_535).nullable().optional(),
+  serviceName: z.string().trim().max(100).nullable().optional(),
+  notes: z.string().trim().max(1_000).default(""),
+  source: z.enum(["manual", "remote-inventory"]).optional()
+});
+const technologyStackSchema = z.array(z.string().trim().min(1).max(80)).max(100).default([]);
 const createProjectSchema = z
   .object({
     name: z.string().trim().min(1).max(100),
     description: z.string().trim().max(2_000).default(""),
     repositoryUrl: z.string().url().nullable().optional(),
     repositoryPath: z.string().trim().min(1).max(320).nullable().optional(),
+    technologyStack: technologyStackSchema,
+    webEndpoints: z.array(projectWebEndpointSchema).max(100).default([]),
     runbook: projectRunbookSchema.default({ overview: "", deployment: "", verification: "", troubleshooting: "", guardrails: "" }),
     servers: z.array(projectServerSchema).max(30).default([]),
     services: z.array(projectServiceSchema).max(100).default([])
@@ -146,6 +159,8 @@ const updateProjectSchema = z.object({
   description: z.string().trim().max(2_000).optional(),
   repositoryUrl: z.string().url().nullable().optional(),
   repositoryPath: z.string().trim().min(1).max(320).nullable().optional(),
+  technologyStack: technologyStackSchema.optional(),
+  webEndpoints: z.array(projectWebEndpointSchema).max(100).optional(),
   runbook: projectRunbookSchema.optional(),
   servers: z.array(projectServerSchema).max(30).optional(),
   services: z.array(projectServiceSchema).max(100).optional()
@@ -235,6 +250,7 @@ function normalizeProjectServices(services: z.infer<typeof projectServiceSchema>
     manager: service.manager,
     identifier: service.identifier,
     port: service.port,
+    portMappings: service.portMappings,
     accessUrl: service.accessUrl,
     critical: service.critical,
     notes: service.notes
@@ -244,15 +260,30 @@ function normalizeProjectServices(services: z.infer<typeof projectServiceSchema>
 function normalizeCreateProjectInput(input: z.infer<typeof createProjectSchema>): CreateProjectInput {
   return {
     ...input,
+    technologyStack: input.technologyStack,
+    webEndpoints: input.webEndpoints.map((endpoint) => ({
+      ...endpoint,
+      port: endpoint.port ?? null,
+      serviceName: endpoint.serviceName || null,
+      source: endpoint.source ?? "manual"
+    })),
     servers: input.servers.map((server) => ({ serverId: server.serverId, role: server.role })),
     services: normalizeProjectServices(input.services)
   };
 }
 
 function normalizeUpdateProjectInput(input: z.infer<typeof updateProjectSchema>): UpdateProjectInput {
-  const { servers, services, ...rest } = input;
+  const { servers, services, webEndpoints, ...rest } = input;
   return {
     ...rest,
+    ...(webEndpoints === undefined ? {} : {
+      webEndpoints: webEndpoints.map((endpoint) => ({
+        ...endpoint,
+        port: endpoint.port ?? null,
+        serviceName: endpoint.serviceName || null,
+        source: endpoint.source ?? "manual"
+      }))
+    }),
     ...(servers === undefined ? {} : { servers: servers.map((server) => ({ serverId: server.serverId, role: server.role })) }),
     ...(services === undefined ? {} : { services: normalizeProjectServices(services) })
   };
@@ -261,6 +292,7 @@ function normalizeUpdateProjectInput(input: z.infer<typeof updateProjectSchema>)
 function syncInventoryProjects(database: GatewayDatabase, server: ServerRecord, inventory: ServerInventory): InventorySyncResult {
   const inputs = discoveredProjectsForInventory(server, inventory);
   const projects = inputs.map((input) => database.syncDiscoveredProject(input));
+  database.clearServerAccessUrl(server.id);
   const archived = inventory.warnings.length ? 0 : database.archiveMissingDiscoveredProjects(server.id, inputs.map((input) => input.sourceKey));
   return { serverId: server.id, collectedAt: inventory.collectedAt, inventory, projects, archived };
 }
@@ -315,7 +347,6 @@ class MetricsScheduler {
     try {
       for (const server of this.database.listServers()) {
         if (server.maintenance || !server.credentialRef) continue;
-        if (server.sshUser === "root" && !this.database.emergencyRootActive(server.id)) continue;
         await this.operations.collectMetrics(server.id, undefined, "scheduler:metrics");
       }
     } finally {
@@ -522,7 +553,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     if (server.sshUser !== "root") return reply.code(409).send({ error: "EmergencyRootNotRequired", message: "这台 VPS 使用的不是 root SSH 登录" });
     const updated = database.grantEmergencyRoot(server.id, body.data.durationMs);
     if (!updated) return reply.code(404).send({ error: "NotFound", message: "未找到 VPS" });
-    database.audit("server.emergency_root.granted", "server", server.id, `开启紧急 root 救援：${server.name}`, "critical", {
+    database.audit("server.emergency_root.granted", "server", server.id, `开启 root 救援提示：${server.name}`, "critical", {
       durationMs: body.data.durationMs,
       until: updated.emergencyRootUntil
     });
