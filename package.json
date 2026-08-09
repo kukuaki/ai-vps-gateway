@@ -11,6 +11,7 @@
     "build": "npm run typecheck && vite build",
     "start": "NODE_ENV=production tsx server/main.ts",
     "mcp": "tsx mcp/index.ts",
+    "sync:all-vps": "tsx scripts/sync-all-vps.ts",
     "typecheck": "vue-tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.server.json",
     "test": "tsx --test server/**/*.test.ts"
   },

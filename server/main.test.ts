@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -44,6 +44,130 @@ describe("local API", () => {
     assert.equal(archiveResponse.statusCode, 200);
     assert.equal(archiveResponse.json().archived, true);
 
+    await app.close();
+  });
+
+  it("previews and applies the fixed all-vps document source", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-sync-"));
+    temporaryDirectories.push(directory);
+    const sourceDirectory = join(directory, "all-vps");
+    mkdirSync(sourceDirectory);
+    writeFileSync(join(sourceDirectory, "VPS_INVENTORY.md"), `# 清单\n\n| 节点 | SSH | 系统与资源 | 主要运行内容 | 主机可见公网监听 |\n| --- | --- | --- | --- | --- |\n| 同步测试 | \`ubuntu@203.0.113.12:22\` | Ubuntu | Nginx | \`22\`、\`443\` |\n`);
+    writeFileSync(join(sourceDirectory, "DOMAINS.md"), "# 域名\n");
+
+    const database = new GatewayDatabase(directory);
+    const app = await buildApp(database, {
+      allVpsSourcePaths: {
+        directory: sourceDirectory,
+        inventoryPath: join(sourceDirectory, "VPS_INVENTORY.md"),
+        domainsPath: join(sourceDirectory, "DOMAINS.md")
+      }
+    });
+    await app.ready();
+
+    const previewResponse = await app.inject({ method: "GET", url: "/api/sync/all-vps/preview" });
+    assert.equal(previewResponse.statusCode, 200);
+    const preview = previewResponse.json() as { source: { digest: string }; summary: { created: number } };
+    assert.equal(preview.summary.created, 1);
+
+    const staleResponse = await app.inject({
+      method: "POST",
+      url: "/api/sync/all-vps",
+      payload: { sourceDigest: "0".repeat(64) }
+    });
+    assert.equal(staleResponse.statusCode, 409);
+
+    const applyResponse = await app.inject({
+      method: "POST",
+      url: "/api/sync/all-vps",
+      payload: { sourceDigest: preview.source.digest }
+    });
+    assert.equal(applyResponse.statusCode, 200);
+    assert.equal(database.listServers().length, 1);
+    assert.equal(database.listServers()[0]?.source, "all-vps");
+
+    await app.close();
+  });
+
+  it("manages a project and its runbook through the local API", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-project-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const app = await buildApp(database);
+    await app.ready();
+
+    const serverResponse = await app.inject({
+      method: "POST",
+      url: "/api/servers",
+      payload: { name: "项目 API 节点", address: "203.0.113.30", sshPort: 22, sshUser: "ubuntu" }
+    });
+    const server = serverResponse.json() as { server: { id: string } };
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload: {
+        name: "API 项目",
+        description: "测试项目",
+        runbook: {
+          overview: "项目入口",
+          deployment: "发布步骤",
+          verification: "验证步骤",
+          troubleshooting: "排错步骤",
+          guardrails: "保护边界"
+        },
+        servers: [{ serverId: server.server.id, role: "primary" }],
+        services: [{ serverId: server.server.id, name: "web", manager: "docker", identifier: "web", critical: true }]
+      }
+    });
+    assert.equal(createResponse.statusCode, 201);
+    const project = createResponse.json() as { project: { id: string; serviceCount: number } };
+    assert.equal(project.project.serviceCount, 1);
+
+    const detailResponse = await app.inject({ method: "GET", url: `/api/projects/${project.project.id}` });
+    assert.equal(detailResponse.statusCode, 200);
+    assert.equal(detailResponse.json().project.runbook.guardrails, "保护边界");
+
+    const updateResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.project.id}`,
+      payload: { description: "更新后的测试项目" }
+    });
+    assert.equal(updateResponse.statusCode, 200);
+    assert.equal(updateResponse.json().project.description, "更新后的测试项目");
+
+    const archiveResponse = await app.inject({ method: "POST", url: `/api/projects/${project.project.id}/archive` });
+    assert.equal(archiveResponse.statusCode, 200);
+    assert.equal(database.listProjects().length, 0);
+    await app.close();
+  });
+
+  it("requires and records a WebUI emergency-root grant for root SSH assets", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-root-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const app = await buildApp(database);
+    await app.ready();
+
+    const serverResponse = await app.inject({
+      method: "POST",
+      url: "/api/servers",
+      payload: { name: "root 救援节点", address: "203.0.113.60", sshPort: 22, sshUser: "root" }
+    });
+    const server = serverResponse.json() as { server: { id: string; emergencyRootUntil: string | null } };
+    assert.equal(server.server.emergencyRootUntil, null);
+
+    const grantResponse = await app.inject({
+      method: "POST",
+      url: `/api/servers/${server.server.id}/emergency-root`,
+      payload: { durationMs: 300_000 }
+    });
+    assert.equal(grantResponse.statusCode, 200);
+    assert.ok(grantResponse.json().server.emergencyRootUntil);
+
+    const revokeResponse = await app.inject({ method: "POST", url: `/api/servers/${server.server.id}/emergency-root/revoke` });
+    assert.equal(revokeResponse.statusCode, 200);
+    assert.equal(revokeResponse.json().server.emergencyRootUntil, null);
+    assert.equal(database.recentAudit().some((event) => event.action === "server.emergency_root.granted"), true);
     await app.close();
   });
 });

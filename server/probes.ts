@@ -57,7 +57,7 @@ export function probeSshBanner(host: string, port: number, timeoutMs = DEFAULT_T
   });
 }
 
-async function probeHttp(check: HealthCheck): Promise<ProbeResult> {
+export async function probeHttp(check: HealthCheck): Promise<ProbeResult> {
   const startedAt = Date.now();
   const url = check.config.url ?? "";
   const expected = check.config.expectedStatusCodes?.length ? check.config.expectedStatusCodes : [200];
@@ -67,7 +67,7 @@ async function probeHttp(check: HealthCheck): Promise<ProbeResult> {
   try {
     const response = await fetch(url, {
       method: "GET",
-      redirect: "manual",
+      redirect: "follow",
       headers: { "user-agent": "ai-vps-gateway-health/0.1" },
       signal: AbortSignal.timeout(boundedTimeout(check.config.timeoutMs))
     });
