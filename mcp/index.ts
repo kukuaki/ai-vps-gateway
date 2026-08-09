@@ -164,6 +164,97 @@ server.registerTool(
 );
 
 server.registerTool(
+  "collect_all_metrics",
+  {
+    title: "Collect all VPS metrics",
+    description: "依次通过本机网关采集所有未归档 all-vps VPS 的当前 CPU、内存、根盘和 load 1m 快照。每台 VPS 使用短暂内部租约，不会绕过其他 AI 会话的独占锁。",
+    annotations: { destructiveHint: false }
+  },
+  async () => {
+    try {
+      return jsonResult(await apiPost("/api/metrics/all", {}));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+server.registerTool(
+  "get_metric_history",
+  {
+    title: "Get VPS metric history",
+    description: "读取一台 VPS 最近保存的 CPU、内存、根盘和 load 1m 性能快照，用于判断短期趋势。不会执行远程命令。",
+    inputSchema: {
+      serverId: z.string().uuid().describe("AI VPS Gateway 中的 VPS UUID"),
+      limit: z.number().int().min(1).max(240).optional().describe("最多读取多少个快照，默认 48"),
+      hours: z.number().int().min(1).max(720).optional().describe("保留最近多少小时的数据，默认 168" )
+    },
+    annotations: { readOnlyHint: true }
+  },
+  async ({ serverId, limit, hours }) => {
+    try {
+      const query = new URLSearchParams();
+      if (limit !== undefined) query.set("limit", String(limit));
+      if (hours !== undefined) query.set("hours", String(hours));
+      return jsonResult(await apiGet(`/api/servers/${serverId}/metrics/history${query.size ? `?${query}` : ""}`));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+server.registerTool(
+  "list_metric_alerts",
+  {
+    title: "List performance alerts",
+    description: "读取性能阈值告警。告警只在状态首次进入高 CPU、内存、磁盘或性能不可用时写入，恢复后再次进入会产生新记录。",
+    inputSchema: { limit: z.number().int().min(1).max(200).optional().describe("最多读取多少条告警，默认 30") },
+    annotations: { readOnlyHint: true }
+  },
+  async ({ limit }) => {
+    try {
+      return jsonResult(await apiGet(`/api/alerts?limit=${limit ?? 30}`));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+server.registerTool(
+  "sync_server_projects",
+  {
+    title: "Inventory and sync VPS projects",
+    description: "通过只读 SSH 盘点 Docker 容器、运行中的 systemd 服务、监听端口和常见项目清单，并同步为本机项目档案与 Runbook。不会读取环境变量、密钥或配置文件内容。",
+    inputSchema: {
+      serverId: z.string().uuid().describe("AI VPS Gateway 中的 VPS UUID"),
+      sessionId: z.string().uuid().optional().describe("可选的 active 网关会话 UUID")
+    }
+  },
+  async ({ serverId, sessionId }) => {
+    try {
+      return jsonResult(await apiPost(`/api/servers/${serverId}/inventory/sync-projects`, { sessionId }));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+server.registerTool(
+  "sync_all_vps_projects",
+  {
+    title: "Inventory all VPS projects",
+    description: "依次通过只读 SSH 盘点所有未归档 all-vps VPS 的 Docker、systemd、监听端口和常见项目清单，并更新本机项目档案与自动 Runbook。不会读取环境变量、密钥或配置内容。"
+  },
+  async () => {
+    try {
+      return jsonResult(await apiPost("/api/inventory/all-vps/sync-projects", {}));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+server.registerTool(
   "get_server",
   {
     title: "Get VPS details",

@@ -1,8 +1,11 @@
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { createConnection } from "node:net";
 import type { HealthCheck, ProbeResult, ProbeSummary, ServerRecord, ServerStatus } from "./types.js";
 import { GatewayDatabase } from "./db.js";
+import { directBindAddress } from "./network.js";
 
-const DEFAULT_TIMEOUT_MS = 3_000;
+const DEFAULT_TIMEOUT_MS = 5_000;
 
 function elapsed(startedAt: number): number {
   return Math.max(0, Date.now() - startedAt);
@@ -12,11 +15,11 @@ function boundedTimeout(value: number | undefined): number {
   return Math.min(Math.max(value ?? DEFAULT_TIMEOUT_MS, 250), 10_000);
 }
 
-export function probeTcp(host: string, port: number, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<ProbeResult> {
+export function probeTcp(host: string, port: number, timeoutMs = DEFAULT_TIMEOUT_MS, localAddress?: string): Promise<ProbeResult> {
   const startedAt = Date.now();
   const timeout = boundedTimeout(timeoutMs);
   return new Promise((resolve) => {
-    const socket = createConnection({ host, port });
+    const socket = createConnection({ host, port, ...(localAddress ? { localAddress } : {}) });
     let settled = false;
     const finish = (result: ProbeResult): void => {
       if (settled) return;
@@ -30,11 +33,11 @@ export function probeTcp(host: string, port: number, timeoutMs = DEFAULT_TIMEOUT
   });
 }
 
-export function probeSshBanner(host: string, port: number, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<ProbeResult> {
+export function probeSshBanner(host: string, port: number, timeoutMs = DEFAULT_TIMEOUT_MS, localAddress?: string): Promise<ProbeResult> {
   const startedAt = Date.now();
   const timeout = boundedTimeout(timeoutMs);
   return new Promise((resolve) => {
-    const socket = createConnection({ host, port });
+    const socket = createConnection({ host, port, ...(localAddress ? { localAddress } : {}) });
     let settled = false;
     let received = "";
     const finish = (ok: boolean, detail: string): void => {
@@ -57,7 +60,69 @@ export function probeSshBanner(host: string, port: number, timeoutMs = DEFAULT_T
   });
 }
 
-export async function probeHttp(check: HealthCheck): Promise<ProbeResult> {
+function requestHttp(
+  url: URL,
+  expected: number[],
+  timeout: number,
+  localAddress: string | undefined,
+  connectAddress: string | undefined,
+  startedAt: number,
+  redirectCount: number
+): Promise<ProbeResult> {
+  return new Promise((resolve) => {
+    const client = url.protocol === "https:" ? httpsRequest : httpRequest;
+    const remaining = Math.max(250, timeout - elapsed(startedAt));
+    let timedOut = false;
+    const targetHost = connectAddress && redirectCount === 0 ? connectAddress : url.hostname;
+    const directTarget = targetHost !== url.hostname;
+    const request = client({
+      hostname: targetHost,
+      port: url.port || undefined,
+      path: `${url.pathname}${url.search}`,
+      method: "GET",
+      headers: {
+        "user-agent": "ai-vps-gateway-health/0.1",
+        ...(directTarget ? { host: url.host } : {})
+      },
+      ...(url.protocol === "https:" && directTarget ? { servername: url.hostname } : {}),
+      ...(localAddress ? { localAddress } : {})
+    }, (response) => {
+      const location = response.headers.location;
+      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && location && redirectCount < 3) {
+        response.resume();
+        const nextUrl = new URL(location, url);
+        const nextConnectAddress = nextUrl.hostname === url.hostname ? connectAddress : undefined;
+        void requestHttp(nextUrl, expected, timeout, localAddress, nextConnectAddress, startedAt, redirectCount + 1).then(resolve);
+        return;
+      }
+      const statusCode = response.statusCode ?? 0;
+      response.resume();
+      const ok = expected.includes(statusCode);
+      resolve({
+        kind: "http",
+        name: url.toString(),
+        ok,
+        latencyMs: elapsed(startedAt),
+        detail: ok ? `HTTP ${statusCode} 命中预期` : `HTTP ${statusCode}，预期 ${expected.join(", ")}`,
+        statusCode
+      });
+    });
+    request.setTimeout(remaining, () => {
+      timedOut = true;
+      request.destroy();
+    });
+    request.once("error", (error: Error) => resolve({
+      kind: "http",
+      name: url.toString(),
+      ok: false,
+      latencyMs: elapsed(startedAt),
+      detail: timedOut ? `请求超时（${timeout} ms）` : error.message
+    }));
+    request.end();
+  });
+}
+
+export async function probeHttp(check: HealthCheck, localAddress?: string, connectAddress?: string): Promise<ProbeResult> {
   const startedAt = Date.now();
   const url = check.config.url ?? "";
   const expected = check.config.expectedStatusCodes?.length ? check.config.expectedStatusCodes : [200];
@@ -65,29 +130,15 @@ export async function probeHttp(check: HealthCheck): Promise<ProbeResult> {
     return { kind: "http", name: check.name, ok: false, latencyMs: elapsed(startedAt), detail: "URL 必须以 http:// 或 https:// 开头" };
   }
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      redirect: "follow",
-      headers: { "user-agent": "ai-vps-gateway-health/0.1" },
-      signal: AbortSignal.timeout(boundedTimeout(check.config.timeoutMs))
-    });
-    const ok = expected.includes(response.status);
-    return {
-      kind: "http",
-      name: check.name,
-      ok,
-      latencyMs: elapsed(startedAt),
-      detail: ok ? `HTTP ${response.status} 命中预期` : `HTTP ${response.status}，预期 ${expected.join(", ")}`,
-      statusCode: response.status
-    };
+    return await requestHttp(new URL(url), expected, boundedTimeout(check.config.timeoutMs), localAddress, connectAddress, startedAt, 0).then((result) => ({ ...result, name: check.name }));
   } catch (error) {
     return { kind: "http", name: check.name, ok: false, latencyMs: elapsed(startedAt), detail: error instanceof Error ? error.message : "HTTP 请求失败" };
   }
 }
 
-async function runConfiguredCheck(check: HealthCheck, server: ServerRecord): Promise<ProbeResult> {
-  if (check.kind === "http") return probeHttp(check);
-  return probeTcp(check.config.host ?? server.address, check.config.port ?? server.sshPort, check.config.timeoutMs).then((result) => ({ ...result, kind: "tcp", name: check.name }));
+async function runConfiguredCheck(check: HealthCheck, server: ServerRecord, localAddress?: string): Promise<ProbeResult> {
+  if (check.kind === "http") return probeHttp(check, localAddress, server.networkMode === "direct" ? server.address : undefined);
+  return probeTcp(check.config.host ?? server.address, check.config.port ?? server.sshPort, check.config.timeoutMs, localAddress).then((result) => ({ ...result, kind: "tcp", name: check.name }));
 }
 
 function statusFor(results: ProbeResult[], hasConfiguredChecks: boolean): ServerStatus {
@@ -111,8 +162,23 @@ export async function probeServer(database: GatewayDatabase, server: ServerRecor
     return summary;
   }
 
-  const baselineTcp = await probeTcp(server.address, server.sshPort);
-  const baselineSsh = baselineTcp.ok ? await probeSshBanner(server.address, server.sshPort) : {
+  const localAddress = server.networkMode === "direct" ? directBindAddress() : undefined;
+  if (server.networkMode === "direct" && !localAddress) {
+    const error = "直连模式找不到物理网卡地址，请设置 ALLVPS_SSH_DIRECT_INTERFACE";
+    const result: ProbeResult = {
+      kind: "tcp",
+      name: `Direct ${server.address}:${server.sshPort}`,
+      ok: false,
+      latencyMs: 0,
+      detail: error
+    };
+    const summary: ProbeSummary = { serverId: server.id, status: "ssh_unreachable", checkedAt, results: [result], error };
+    database.updateProbe(server.id, summary.status, checkedAt, error);
+    database.addHealthEvent(server.id, checkedAt, summary.status, summary.results, error);
+    return summary;
+  }
+  const baselineTcp = await probeTcp(server.address, server.sshPort, DEFAULT_TIMEOUT_MS, localAddress ?? undefined);
+  const baselineSsh = baselineTcp.ok ? await probeSshBanner(server.address, server.sshPort, DEFAULT_TIMEOUT_MS, localAddress ?? undefined) : {
     kind: "ssh_banner" as const,
     name: `SSH Banner ${server.address}:${server.sshPort}`,
     ok: false,
@@ -120,7 +186,7 @@ export async function probeServer(database: GatewayDatabase, server: ServerRecor
     detail: "TCP 连接失败，跳过 SSH Banner"
   };
   const configuredChecks = server.healthChecks.filter((check) => check.enabled);
-  const serviceResults = await Promise.all(configuredChecks.map((check) => runConfiguredCheck(check, server)));
+  const serviceResults = await Promise.all(configuredChecks.map((check) => runConfiguredCheck(check, server, localAddress ?? undefined)));
   const results = [baselineTcp, baselineSsh, ...serviceResults];
   const status = statusFor(results, configuredChecks.length > 0);
   const failures = results.filter((result) => !result.ok).map((result) => `${result.name}: ${result.detail}`);

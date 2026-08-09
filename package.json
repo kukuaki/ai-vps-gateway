@@ -12,6 +12,8 @@
     "start": "NODE_ENV=production tsx server/main.ts",
     "mcp": "tsx mcp/index.ts",
     "sync:all-vps": "tsx scripts/sync-all-vps.ts",
+    "sync:vps-projects": "tsx scripts/sync-vps-projects.ts",
+    "collect:all-metrics": "tsx scripts/collect-all-metrics.ts",
     "import:all-vps-credentials": "tsx scripts/import-all-vps-credentials.ts",
     "typecheck": "vue-tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.server.json",
     "test": "tsx --test server/**/*.test.ts"

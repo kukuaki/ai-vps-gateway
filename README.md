@@ -9,8 +9,9 @@ Local-first VPS inventory, health monitoring, and MCP gateway for personal AI-as
 - Manual VPS inventory with local SQLite persistence.
 - Synchronize VPS inventory and documented domain health checks from an existing `all-vps` directory.
 - Network-safe liveness checks: TCP, SSH banner, and HTTP(S). ICMP is intentionally not required.
-- Health history, audit events, archive and maintenance states.
+- Health history, current metric snapshots, 30-day metric history, SVG trend charts, threshold alerts, audit events, archive and maintenance states.
 - Project records linking VPS assets, Docker/systemd/process services, and structured runbooks.
+- Read-only remote project inventory that discovers Docker, systemd, listening ports, and common manifests, then updates generated project runbooks.
 - A local Vue WebUI bound to `127.0.0.1`.
 - A local stdio MCP gateway for Codex and Claude Code. Read operations are available immediately; remote commands require an exclusive gateway session.
 
@@ -25,6 +26,7 @@ The gateway deliberately does **not** read, upload, or expose private key conten
 - VPS records whose SSH user is `root` are enabled once from the WebUI for an eight-hour root-access window and a session is opened immediately. No per-command or per-session confirmation is required during that window; enabling, expiry, and revocation are audited.
 - Command text and output are redacted before persistence and command records are pruned after 90 days by default. Asset/project summaries and audit events remain in local SQLite.
 - A failed ICMP ping does not mark a VPS offline. SSH/TCP and configured service probes are authoritative.
+- SSH execution never inherits HTTP/SOCKS proxy variables, disables `ProxyCommand` and `ProxyJump`, and can bind selected assets to a physical interface with `networkMode=direct`. This is useful when a macOS TUN client would otherwise make a domestic provider see a proxy egress address.
 - The `all-vps` synchronizer never reads private keys. Its sync operation preserves the local credential reference and emergency-root state.
 
 ## Requirements
@@ -56,6 +58,8 @@ Runtime data is stored outside the repository by default:
 
 Set `ALLVPS_DATA_DIR` to override it during development or testing.
 
+When the gateway stays running, the metric scheduler collects eligible VPS snapshots every five minutes and retains them for 30 days. Root assets are skipped until their WebUI emergency-access window is active. The overview and VPS detail pages show the stored history; CPU at 90% or above, memory at 90% or above, disk at 85% or above, and a transition to unavailable performance create a deduplicated warning audit event.
+
 SSH execution uses these local-only defaults:
 
 ```text
@@ -85,6 +89,20 @@ Set `ALLVPS_SOURCE_DIR` to use another local directory. The synchronizer reads o
 
 Synchronization identifies an asset by SSH address and port, then updates documented identity, SSH login metadata, role, tags, access URL, and HTTP health checks. Local credential references and maintenance state are preserved. Assets removed from the source documents are shown in the preview and are never automatically archived. The WebUI validates the preview digest before applying a sync, so a changed source must be previewed again.
 
+## Synchronizing Remote Projects
+
+The project inventory is a read-only SSH operation. It collects bounded metadata only: hostname, OS, Docker container names/images/status/ports, non-baseline systemd units, listening TCP ports, and shallow manifest paths under common application directories. It does not read configuration contents, environment variables, logs, private keys, or tokens. The result is stored locally and used to create or update deterministic `remote-inventory` projects with overview, deployment, verification, troubleshooting, and guardrail sections. Missing automatic projects are archived rather than deleted, and a warning-bearing partial inventory does not archive anything.
+
+```bash
+npm run sync:vps-projects
+```
+
+The WebUI and MCP also provide single-server and all-server inventory actions.
+
+## SSH Network Routing
+
+Each VPS has a `system` or `direct` network mode. `system` follows the operating system route, while `direct` makes OpenSSH and TCP/HTTP health probes bind the connection to the detected physical interface (or `ALLVPS_SSH_DIRECT_INTERFACE`, such as `en0`). For a direct HTTPS check, the gateway connects to the VPS address while preserving the configured host name and TLS SNI, which avoids a TUN fake-IP DNS result. The current domestic Tencent Cloud asset is configured as `direct` in local SQLite; this setting is intentionally not stored in the repository. The mode affects gateway traffic only and does not change Clash/TUN global routing rules.
+
 ## Importing all-vps Credentials
 
 This explicit local command is separate from Markdown synchronization. It only examines top-level `.key` and `.pem` filenames containing a registered VPS address, and requires exactly one match per VPS. It does not read, print, or upload key contents, delete the source file, overwrite an existing reference, or overwrite an existing gateway credential file.
@@ -111,7 +129,7 @@ Start the local API first, then register the stdio adapter with your client:
 }
 ```
 
-Available tools include `list_servers`, `get_server`, `get_dashboard`, `list_projects`, `get_project`, `list_sessions`, `open_session`, `get_session`, `run_command`, `close_session`, and `collect_metrics`.
+Available tools include `list_servers`, `get_server`, `get_dashboard`, `list_projects`, `get_project`, `list_sessions`, `open_session`, `get_session`, `run_command`, `close_session`, `collect_metrics`, `collect_all_metrics`, `get_metric_history`, `list_metric_alerts`, `sync_server_projects`, and `sync_all_vps_projects`.
 
 The normal execution flow is: open a session, wait if it is queued, run commands through `run_command`, collect current metrics when needed, then close the session. A root VPS receives one eight-hour access window from the WebUI, then follows the same flow. The API and MCP adapter remain bound to `127.0.0.1`; the AI client receives neither a private key nor an unrestricted local SSH path.
 

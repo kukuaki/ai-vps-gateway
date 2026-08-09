@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import type { ServerRecord } from "./types.js";
 import { MAX_OUTPUT_BYTES } from "./command-policy.js";
 import { CredentialStore } from "./credentials.js";
+import { detectDirectInterface, normalizeDirectInterface } from "./network.js";
 
 export interface SshExecutionResult {
   exitCode: number | null;
@@ -19,6 +20,7 @@ export interface SshExecutorOptions {
   sshBinary?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
+  directInterface?: string | null;
 }
 
 function boundedTimeout(value: number | undefined): number {
@@ -38,18 +40,23 @@ export class SshExecutor {
   private readonly sshBinary: string;
   private readonly defaultTimeoutMs: number;
   private readonly maxOutputBytes: number;
+  private readonly directInterface: string | null;
 
   constructor(options: SshExecutorOptions = {}) {
     this.credentialStore = options.credentialStore ?? new CredentialStore();
     this.sshBinary = options.sshBinary ?? process.env.ALLVPS_SSH_BIN ?? "ssh";
     this.defaultTimeoutMs = boundedTimeout(options.timeoutMs);
     this.maxOutputBytes = Math.min(Math.max(options.maxOutputBytes ?? MAX_OUTPUT_BYTES, 1_024), 4 * 1024 * 1024);
+    this.directInterface = options.directInterface === undefined ? detectDirectInterface() : normalizeDirectInterface(options.directInterface);
   }
 
   async execute(server: ServerRecord, command: string, timeoutMs = this.defaultTimeoutMs): Promise<SshExecutionResult> {
     const credentialPath = this.credentialStore.pathFor(server);
     if (!this.credentialStore.hasKnownHosts()) {
       throw new Error("本机没有可用的 SSH known_hosts，网关拒绝在未校验主机指纹的情况下连接");
+    }
+    if (server.networkMode === "direct" && !this.directInterface) {
+      throw new Error("直连模式找不到可用的物理网卡；请设置 ALLVPS_SSH_DIRECT_INTERFACE，例如 en0");
     }
 
     const startedAt = Date.now();
@@ -88,6 +95,11 @@ export class SshExecutor {
       "VerifyHostKeyDNS=no",
       "-o",
       "ProxyCommand=none",
+      "-o",
+      "ProxyJump=none",
+      ...(server.networkMode === "direct"
+        ? ["-o", `BindInterface=${this.directInterface as string}`]
+        : []),
       "-o",
       "ConnectTimeout=10",
       "-o",

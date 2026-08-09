@@ -1,5 +1,6 @@
 export type ServerStatus = "unknown" | "healthy" | "degraded" | "ssh_unreachable" | "offline" | "maintenance" | "archived";
 export type ServerSource = "manual" | "all-vps";
+export type SshNetworkMode = "system" | "direct";
 export type HealthCheckKind = "http" | "tcp";
 
 export interface HealthCheckConfig {
@@ -29,6 +30,7 @@ export interface ServerRecord {
   address: string;
   sshPort: number;
   sshUser: string;
+  networkMode: SshNetworkMode;
   credentialRef: string | null;
   emergencyRootUntil: string | null;
   role: string;
@@ -119,6 +121,63 @@ export interface ServerDetail {
   server: ServerRecord;
   events: HealthEvent[];
   metric: MetricSnapshot | null;
+  inventory: ServerInventory | null;
+}
+
+export interface RemoteInventoryProject {
+  key: string;
+  name: string;
+  path: string;
+  manifest: string;
+}
+
+export interface RemoteInventoryService {
+  manager: ServiceManager;
+  name: string;
+  identifier: string;
+  status: string;
+  image: string | null;
+  ports: string | null;
+  projectPath: string | null;
+}
+
+export interface ServerInventory {
+  serverId: string;
+  collectedAt: string;
+  hostname: string | null;
+  os: string | null;
+  kernel: string | null;
+  dockerAvailable: boolean;
+  projects: RemoteInventoryProject[];
+  services: RemoteInventoryService[];
+  listeningPorts: string[];
+  warnings: string[];
+}
+
+export interface ServerProjectSyncResult {
+  serverId: string;
+  collectedAt: string;
+  inventory: ServerInventory;
+  projects: Array<{ action: "created" | "updated" | "unchanged"; project: ProjectDetail }>;
+  archived: number;
+}
+
+export interface AllVpsProjectSyncResponse {
+  results: Array<ServerProjectSyncResult | { serverId: string; error: string }>;
+  summary: { total: number; success: number; failed: number; created: number; updated: number; archived: number };
+}
+
+export interface MetricHistoryResponse {
+  metrics: MetricSnapshot[];
+}
+
+export interface AllMetricsResponse {
+  results: Array<{ serverId: string; metric?: MetricSnapshot | null; error?: string }>;
+  summary: { total: number; success: number; unavailable: number; failed: number };
+}
+
+export interface AlertResponse {
+  alerts: AuditEvent[];
 }
 
 export interface DashboardSummary {
@@ -151,6 +210,7 @@ export interface ServerPayload {
   address: string;
   sshPort: number;
   sshUser: string;
+  networkMode: SshNetworkMode;
   credentialRef: string | null;
   role: string;
   environment: string;
@@ -202,6 +262,9 @@ export interface ProjectService {
 
 export interface ProjectRecord {
   id: string;
+  source: "manual" | "remote-inventory";
+  sourceKey: string | null;
+  sourceSyncedAt: string | null;
   name: string;
   description: string;
   repositoryUrl: string | null;

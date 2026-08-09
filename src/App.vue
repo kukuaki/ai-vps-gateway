@@ -31,10 +31,12 @@ import type {
   ProjectPayload,
   ProjectRecord,
   ProjectRunbook,
+  MetricSnapshot,
   ServerDetail,
   ServerPayload,
   ServerRecord,
   ServerStatus,
+  SshNetworkMode,
   ServiceManager,
   SessionDetail,
   SessionRecord
@@ -45,7 +47,11 @@ type ViewName = "overview" | "servers" | "projects" | "audit";
 const activeView = ref<ViewName>("overview");
 const dashboard = ref<DashboardResponse | null>(null);
 const auditEvents = ref<AuditEvent[]>([]);
+const metricAlertEvents = ref<AuditEvent[]>([]);
 const selected = ref<ServerDetail | null>(null);
+const metricHistory = ref<MetricSnapshot[]>([]);
+const fleetMetricHistories = ref<Record<string, MetricSnapshot[]>>({});
+const metricHistoryHours = ref(24 * 7);
 const isLoading = ref(true);
 const isSaving = ref(false);
 const isProbing = ref<string | null>(null);
@@ -64,8 +70,11 @@ const selectedSession = ref<SessionDetail | null>(null);
 const showProjectEditor = ref(false);
 const editingProjectId = ref<string | null>(null);
 const isProjectSaving = ref(false);
+const isProjectSyncing = ref(false);
+const isAllProjectSyncing = ref(false);
 const isSessionAction = ref(false);
 const isCollectingMetrics = ref(false);
+const isAllMetricsCollecting = ref(false);
 const isRootAction = ref(false);
 const projectQuery = ref("");
 const ROOT_ACCESS_DURATION_MS = 8 * 60 * 60_000;
@@ -75,6 +84,7 @@ interface FormState {
   address: string;
   sshPort: number;
   sshUser: string;
+  networkMode: SshNetworkMode;
   credentialRef: string;
   role: string;
   environment: string;
@@ -117,6 +127,7 @@ const form = reactive<FormState>({
   address: "",
   sshPort: 22,
   sshUser: "ubuntu",
+  networkMode: "system",
   credentialRef: "",
   role: "",
   environment: "production",
@@ -184,6 +195,80 @@ const selectedServerSession = computed(() => {
 const isEditing = computed(() => editingId.value !== null);
 const isProjectEditing = computed(() => editingProjectId.value !== null);
 
+type MetricKey = "cpuPercent" | "memoryPercent" | "diskPercent" | "load1";
+interface MetricCard {
+  key: MetricKey;
+  label: string;
+  unit: string;
+  current: number | null;
+  path: string;
+  color: string;
+}
+
+function metricPath(values: Array<number | null>): string {
+  const valid = values.filter((value): value is number => value !== null && Number.isFinite(value));
+  if (!valid.length) return "";
+  const minimum = Math.min(...valid);
+  const maximum = Math.max(...valid);
+  const range = maximum === minimum ? Math.max(Math.abs(maximum) * 0.1, 1) : maximum - minimum;
+  return values
+    .map((value, index) => {
+      if (value === null || !Number.isFinite(value)) return null;
+      const x = values.length === 1 ? 50 : (index / (values.length - 1)) * 100;
+      const y = 28 - ((value - minimum) / range) * 22;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .filter((point): point is string => point !== null)
+    .join(" ");
+}
+
+const metricCards = computed<MetricCard[]>(() => {
+  const points = metricHistory.value.length ? metricHistory.value : selected.value?.metric ? [selected.value.metric] : [];
+  const definitions: Array<{ key: MetricKey; label: string; unit: string; color: string }> = [
+    { key: "cpuPercent", label: "CPU", unit: "%", color: "#2b7a52" },
+    { key: "memoryPercent", label: "内存", unit: "%", color: "#b06d2c" },
+    { key: "diskPercent", label: "磁盘", unit: "%", color: "#3e6e9c" },
+    { key: "load1", label: "Load 1m", unit: "", color: "#8a4f72" }
+  ];
+  return definitions.map((definition) => {
+    const values = points.map((point) => point[definition.key]);
+    return {
+      ...definition,
+      current: values.at(-1) ?? null,
+      path: metricPath(values)
+    };
+  });
+});
+
+const metricHistoryLabel = computed(() => {
+  if (!metricHistory.value.length) return "尚未采集";
+  return metricHistory.value.length === 1 ? "1 次采集" : `最近 ${metricHistory.value.length} 次采集`;
+});
+
+const METRIC_ALERT_THRESHOLDS = {
+  cpuPercent: 90,
+  memoryPercent: 90,
+  diskPercent: 85
+} as const;
+
+function latestFleetMetric(serverId: string): MetricSnapshot | null {
+  return fleetMetricHistories.value[serverId]?.at(-1) ?? null;
+}
+
+function fleetMetricPath(serverId: string, key: MetricKey): string {
+  return metricPath((fleetMetricHistories.value[serverId] ?? []).map((metric) => metric[key]));
+}
+
+function metricAlertLabels(metric: MetricSnapshot | null): string[] {
+  if (!metric) return [];
+  if (metric.source === "unavailable") return ["性能不可用"];
+  const alerts: string[] = [];
+  if ((metric.cpuPercent ?? 0) >= METRIC_ALERT_THRESHOLDS.cpuPercent) alerts.push("CPU 高");
+  if ((metric.memoryPercent ?? 0) >= METRIC_ALERT_THRESHOLDS.memoryPercent) alerts.push("内存高");
+  if ((metric.diskPercent ?? 0) >= METRIC_ALERT_THRESHOLDS.diskPercent) alerts.push("磁盘将满");
+  return alerts;
+}
+
 function emptyRunbook(): ProjectRunbook {
   return { overview: "", deployment: "", verification: "", troubleshooting: "", guardrails: "" };
 }
@@ -194,6 +279,7 @@ function resetForm(): void {
     address: "",
     sshPort: 22,
     sshUser: "ubuntu",
+    networkMode: "system",
     credentialRef: "",
     role: "",
     environment: "production",
@@ -268,13 +354,24 @@ async function refresh(selectId?: string): Promise<void> {
   isLoading.value = !dashboard.value;
   errorMessage.value = null;
   try {
-    const [nextDashboard, nextAudit, nextProjects, nextSessions] = await Promise.all([api.dashboard(), api.audit(), api.projects(), api.sessions()]);
+    const [nextDashboard, nextAudit, nextAlerts, nextProjects, nextSessions] = await Promise.all([api.dashboard(), api.audit(), api.alerts(), api.projects(), api.sessions()]);
     dashboard.value = nextDashboard;
     auditEvents.value = nextAudit.events;
+    metricAlertEvents.value = nextAlerts.alerts;
     projects.value = nextProjects.projects;
     sessions.value = nextSessions.sessions;
+    const metricEntries = await Promise.all(nextDashboard.servers.map(async (server) => {
+      const response = await api.metricHistory(server.id).catch(() => ({ metrics: [] }));
+      return [server.id, response.metrics] as const;
+    }));
+    fleetMetricHistories.value = Object.fromEntries(metricEntries);
     const targetId = selectId ?? selected.value?.server.id;
-    if (targetId) selected.value = await api.server(targetId).catch(() => null);
+    if (targetId) {
+      selected.value = await api.server(targetId).catch(() => null);
+      metricHistory.value = selected.value ? await api.metricHistory(targetId, 48, metricHistoryHours.value).then((result) => result.metrics).catch(() => []) : [];
+    } else {
+      metricHistory.value = [];
+    }
     const existingSession = selectedSession.value;
     const sessionId = existingSession && existingSession.serverId === targetId
       ? existingSession.id
@@ -300,7 +397,9 @@ async function openProject(project: ProjectRecord): Promise<void> {
 
 async function openServer(server: ServerRecord): Promise<void> {
   try {
-    selected.value = await api.server(server.id);
+    const [detail, history] = await Promise.all([api.server(server.id), api.metricHistory(server.id, 48, metricHistoryHours.value).catch(() => ({ metrics: [] }))]);
+    selected.value = detail;
+    metricHistory.value = history.metrics;
     const session = sessions.value.find((item) => item.serverId === server.id);
     selectedSession.value = session ? await api.session(session.id).then((result) => result.session).catch(() => null) : null;
     activeView.value = "servers";
@@ -376,12 +475,68 @@ async function collectMetrics(server: ServerRecord): Promise<void> {
   try {
     const sessionId = selectedServerSession.value?.status === "active" ? selectedServerSession.value.id : undefined;
     await api.collectMetrics(server.id, sessionId);
-    selected.value = await api.server(server.id);
+    const [detail, history] = await Promise.all([api.server(server.id), api.metricHistory(server.id, 48, metricHistoryHours.value).catch(() => ({ metrics: [] }))]);
+    selected.value = detail;
+    metricHistory.value = history.metrics;
     notify(selected.value.metric?.source === "ssh" ? `${server.name} 性能已更新` : "当前性能暂不可用，详情已记录");
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : "性能采集失败";
   } finally {
     isCollectingMetrics.value = false;
+  }
+}
+
+async function reloadSelectedMetricHistory(): Promise<void> {
+  const serverId = selectedServer.value?.id;
+  if (!serverId) return;
+  try {
+    metricHistory.value = (await api.metricHistory(serverId, 48, metricHistoryHours.value)).metrics;
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "读取性能历史失败";
+  }
+}
+
+async function collectAllMetrics(): Promise<void> {
+  isAllMetricsCollecting.value = true;
+  errorMessage.value = null;
+  try {
+    const selectedId = selectedServer.value?.id;
+    const result = await api.collectAllMetrics();
+    await refresh(selectedId);
+    notify(`全部 VPS 性能采集完成：成功 ${result.summary.success}，不可用 ${result.summary.unavailable}，失败 ${result.summary.failed}`);
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "批量性能采集失败";
+  } finally {
+    isAllMetricsCollecting.value = false;
+  }
+}
+
+async function syncServerProjects(server: ServerRecord): Promise<void> {
+  isProjectSyncing.value = true;
+  errorMessage.value = null;
+  try {
+    const sessionId = selectedServerSession.value?.status === "active" ? selectedServerSession.value.id : undefined;
+    const result = await api.syncServerProjects(server.id, sessionId);
+    await refresh(server.id);
+    notify(`${server.name} 项目已同步：新增 ${result.projects.filter((project) => project.action === "created").length}，更新 ${result.projects.filter((project) => project.action === "updated").length}，归档 ${result.archived}`);
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "项目盘点失败";
+  } finally {
+    isProjectSyncing.value = false;
+  }
+}
+
+async function syncAllVpsProjects(): Promise<void> {
+  isAllProjectSyncing.value = true;
+  errorMessage.value = null;
+  try {
+    const result = await api.syncAllVpsProjects();
+    await refresh();
+    notify(`全部 VPS 项目同步完成：成功 ${result.summary.success}，失败 ${result.summary.failed}，新增 ${result.summary.created}，归档 ${result.summary.archived}`);
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "批量项目盘点失败";
+  } finally {
+    isAllProjectSyncing.value = false;
   }
 }
 
@@ -398,6 +553,7 @@ function openEdit(server: ServerRecord): void {
     address: server.address,
     sshPort: server.sshPort,
     sshUser: server.sshUser,
+    networkMode: server.networkMode,
     credentialRef: server.credentialRef ?? "",
     role: server.role,
     environment: server.environment,
@@ -430,6 +586,7 @@ function serverPayload(): ServerPayload {
     address: form.address.trim(),
     sshPort: Number(form.sshPort),
     sshUser: form.sshUser.trim(),
+    networkMode: form.networkMode,
     credentialRef: form.credentialRef.trim() || null,
     role: form.role.trim(),
     environment: form.environment.trim() || "production",
@@ -701,6 +858,8 @@ onMounted(() => void refresh());
         </div>
         <div class="topbar-actions">
           <button class="icon-button" title="预览 all-vps 同步" :disabled="isSyncing" @click="openAllVpsSync"><FolderSync :size="18" :class="{ spinning: isSyncing }" /></button>
+          <button class="icon-button" title="盘点并同步全部 VPS 项目" :disabled="isAllProjectSyncing" @click="syncAllVpsProjects"><FolderKanban :size="18" :class="{ spinning: isAllProjectSyncing }" /></button>
+          <button class="icon-button" title="立即采集全部 VPS 性能" :disabled="isAllMetricsCollecting" @click="collectAllMetrics"><Gauge :size="18" :class="{ spinning: isAllMetricsCollecting }" /></button>
           <button class="icon-button" title="刷新数据" :disabled="isLoading" @click="refresh()"><RefreshCw :size="18" :class="{ spinning: isLoading }" /></button>
           <button class="primary-button" @click="activeView === 'projects' ? openCreateProject() : openCreate()"><Plus :size="18" /> {{ activeView === 'projects' ? '添加项目' : '添加 VPS' }}</button>
         </div>
@@ -737,6 +896,26 @@ onMounted(() => void refresh());
           <div class="panel-heading"><div><h2>测活判定</h2><p>ICMP 不是状态前提</p></div><Gauge :size="20" /></div>
           <div class="signal-flow"><span>TCP 端口</span><i></i><span>SSH Banner</span><i></i><span>项目 HTTP/TCP</span></div>
         </section>
+
+        <section class="panel performance-overview-panel">
+          <div class="panel-heading"><div><h2>性能趋势</h2><p>网关运行期间每 5 分钟采集，保留最近 30 天</p></div><div class="panel-heading-actions"><button class="mini-icon" title="立即采集全部 VPS 性能" :disabled="isAllMetricsCollecting" @click="collectAllMetrics"><Gauge :size="15" :class="{ spinning: isAllMetricsCollecting }" /></button><button class="text-button" @click="activeView = 'servers'">查看详情 <ArrowUpRight :size="15" /></button></div></div>
+          <div v-if="visibleServers.length" class="fleet-metric-list">
+            <button v-for="server in visibleServers" :key="server.id" class="fleet-metric-row" @click="openServer(server)">
+              <span class="fleet-metric-name"><strong>{{ server.name }}</strong><small>{{ latestFleetMetric(server.id) ? humanTime(latestFleetMetric(server.id)?.collectedAt ?? null) : '尚未采集' }}</small></span>
+              <span v-if="latestFleetMetric(server.id)?.source === 'ssh'" class="fleet-metric-values"><span>CPU {{ latestFleetMetric(server.id)?.cpuPercent ?? '—' }}%</span><span>内存 {{ latestFleetMetric(server.id)?.memoryPercent ?? '—' }}%</span><span>磁盘 {{ latestFleetMetric(server.id)?.diskPercent ?? '—' }}%</span></span>
+              <span v-else class="fleet-metric-unavailable">{{ latestFleetMetric(server.id)?.note || '等待采集' }}</span>
+              <svg class="fleet-metric-sparkline" viewBox="0 0 100 30" role="img" :aria-label="`${server.name} CPU 趋势`"><polyline v-if="fleetMetricPath(server.id, 'cpuPercent')" :points="fleetMetricPath(server.id, 'cpuPercent')" /></svg>
+              <span v-if="metricAlertLabels(latestFleetMetric(server.id)).length" class="metric-alert-label">{{ metricAlertLabels(latestFleetMetric(server.id))[0] }}</span>
+            </button>
+          </div>
+          <div v-else class="empty-inline">还没有可展示的 VPS 性能数据。</div>
+        </section>
+
+        <section class="panel alert-overview-panel">
+          <div class="panel-heading"><div><h2>性能告警</h2><p>只在阈值首次触发时记录，避免重复刷屏</p></div><BellRing :size="20" /></div>
+          <div v-if="metricAlertEvents.length" class="audit-list compact-audit-list"><div v-for="event in metricAlertEvents.slice(0, 5)" :key="event.id"><span :class="['audit-mark', event.severity]"></span><div><strong>{{ event.summary }}</strong><small>{{ humanTime(event.createdAt) }}</small></div></div></div>
+          <div v-else class="empty-inline">暂无性能告警</div>
+        </section>
       </section>
 
       <section v-else-if="activeView === 'servers'" class="content-area servers-view">
@@ -744,13 +923,14 @@ onMounted(() => void refresh());
         <template v-if="selectedServer">
           <section class="detail-header">
             <div><div class="server-title"><span :class="['status-dot', statusOf(selectedServer.status).tone]"></span><h2>{{ selectedServer.name }}</h2><span :class="['status-badge', statusOf(selectedServer.status).tone]">{{ statusOf(selectedServer.status).label }}</span></div><p>{{ selectedServer.sshUser }}@{{ selectedServer.address }}:{{ selectedServer.sshPort }} <span v-if="selectedServer.role">· {{ selectedServer.role }}</span></p></div>
-            <div class="detail-actions"><a v-if="selectedServer.accessUrl" class="icon-button link-button" :href="selectedServer.accessUrl" target="_blank" rel="noreferrer" title="打开访问地址"><Globe2 :size="18" /></a><button class="icon-button" title="立即测活" :disabled="isProbing === selectedServer.id" @click="probe(selectedServer)"><RefreshCw :size="18" :class="{ spinning: isProbing === selectedServer.id }" /></button><button v-if="selectedServer.sshUser === 'root' && !emergencyRootActive(selectedServer)" class="danger-button" :disabled="isRootAction || isSessionAction" @click="enableRootAndOpenSession(selectedServer)"><ShieldCheck :size="16" /> 启用 root 并开启会话</button><button v-else-if="!selectedServerSession" class="secondary-button" :disabled="isSessionAction" @click="openAiSession(selectedServer)"><ShieldCheck :size="16" /> 开启会话</button><button v-else class="secondary-button" :disabled="isSessionAction" @click="closeAiSession"><X :size="16" /> 释放会话</button><button v-if="selectedServer.sshUser === 'root' && emergencyRootActive(selectedServer)" class="icon-button" title="关闭 root 访问" :disabled="isRootAction" @click="revokeEmergencyRoot(selectedServer)"><ShieldCheck :size="17" /></button><button class="secondary-button" @click="openEdit(selectedServer)">编辑</button><button class="danger-button" @click="archive(selectedServer)"><Archive :size="16" /> 归档</button></div>
+            <div class="detail-actions"><a v-if="selectedServer.accessUrl" class="icon-button link-button" :href="selectedServer.accessUrl" target="_blank" rel="noreferrer" title="打开访问地址"><Globe2 :size="18" /></a><button class="icon-button" title="立即测活" :disabled="isProbing === selectedServer.id" @click="probe(selectedServer)"><RefreshCw :size="18" :class="{ spinning: isProbing === selectedServer.id }" /></button><button class="icon-button" title="盘点并同步项目" :disabled="isProjectSyncing" @click="syncServerProjects(selectedServer)"><FolderSync :size="18" :class="{ spinning: isProjectSyncing }" /></button><button v-if="selectedServer.sshUser === 'root' && !emergencyRootActive(selectedServer)" class="danger-button" :disabled="isRootAction || isSessionAction" @click="enableRootAndOpenSession(selectedServer)"><ShieldCheck :size="16" /> 启用 root 并开启会话</button><button v-else-if="!selectedServerSession" class="secondary-button" :disabled="isSessionAction" @click="openAiSession(selectedServer)"><ShieldCheck :size="16" /> 开启会话</button><button v-else class="secondary-button" :disabled="isSessionAction" @click="closeAiSession"><X :size="16" /> 释放会话</button><button v-if="selectedServer.sshUser === 'root' && emergencyRootActive(selectedServer)" class="icon-button" title="关闭 root 访问" :disabled="isRootAction" @click="revokeEmergencyRoot(selectedServer)"><ShieldCheck :size="17" /></button><button class="secondary-button" @click="openEdit(selectedServer)">编辑</button><button class="danger-button" @click="archive(selectedServer)"><Archive :size="16" /> 归档</button></div>
           </section>
           <div class="detail-grid">
             <section class="panel health-panel"><div class="panel-heading"><div><h2>健康检查</h2><p>{{ humanTime(selectedServer.lastCheckedAt) }}</p></div><Activity :size="20" /></div><div v-if="selected?.events.length" class="probe-list"><div v-for="result in selected.events[0].results" :key="`${selected.events[0].id}-${result.name}`" class="probe-item"><span :class="['status-dot', result.ok ? 'healthy' : 'offline']"></span><span><strong>{{ result.name }}</strong><small>{{ result.detail }}</small></span><em>{{ result.latencyMs }} ms</em></div></div><div v-else class="empty-inline">尚无测活记录</div></section>
-            <section class="panel metrics-panel"><div class="panel-heading"><div><h2>性能</h2><p>{{ selected?.metric ? humanTime(selected.metric.collectedAt) : '尚未采集' }}</p></div><div class="panel-heading-actions"><button class="mini-icon" title="采集当前性能" :disabled="isCollectingMetrics" @click="collectMetrics(selectedServer)"><RefreshCw :size="15" :class="{ spinning: isCollectingMetrics }" /></button><Gauge :size="20" /></div></div><div v-if="selected?.metric" class="metric-grid"><div><span>CPU</span><strong>{{ selected.metric.cpuPercent ?? '—' }}<small v-if="selected.metric.cpuPercent !== null">%</small></strong></div><div><span>内存</span><strong>{{ selected.metric.memoryPercent ?? '—' }}<small v-if="selected.metric.memoryPercent !== null">%</small></strong></div><div><span>磁盘</span><strong>{{ selected.metric.diskPercent ?? '—' }}<small v-if="selected.metric.diskPercent !== null">%</small></strong></div><div><span>Load 1m</span><strong>{{ selected.metric.load1 ?? '—' }}</strong></div></div><div v-if="metricNoteFor(selectedServer)" class="metric-note"><CircleAlert :size="15" /> {{ metricNoteFor(selectedServer) }}</div><div v-else-if="!selected?.metric" class="empty-inline">采集的是当前快照，不安装 Agent，也不会读取当前目录中的私钥。</div></section>
+            <section class="panel metrics-panel"><div class="panel-heading"><div><h2>性能趋势</h2><p>{{ selected?.metric ? `${humanTime(selected.metric.collectedAt)} · ${metricHistoryLabel}` : '尚未采集' }}</p></div><div class="panel-heading-actions"><select v-model.number="metricHistoryHours" class="metric-range-select" title="性能历史范围" @change="reloadSelectedMetricHistory"><option :value="24">24 小时</option><option :value="24 * 7">7 天</option><option :value="24 * 30">30 天</option></select><button class="mini-icon" title="采集当前性能" :disabled="isCollectingMetrics" @click="collectMetrics(selectedServer)"><RefreshCw :size="15" :class="{ spinning: isCollectingMetrics }" /></button><Gauge :size="20" /></div></div><div v-if="selected?.metric" class="metric-grid"><div v-for="card in metricCards" :key="card.key" class="metric-card"><span>{{ card.label }}</span><strong>{{ card.current ?? '—' }}<small v-if="card.current !== null">{{ card.unit }}</small></strong><svg class="metric-sparkline" viewBox="0 0 100 32" role="img" :aria-label="`${card.label} 最近趋势`"><path d="M0 28H100" /><polyline v-if="card.path" :points="card.path" :style="{ stroke: card.color }" /></svg></div></div><div v-if="metricAlertLabels(selected?.metric ?? null).length" class="metric-alert"><CircleAlert :size="15" /> {{ metricAlertLabels(selected?.metric ?? null).join('、') }}：请结合 Runbook 检查。</div><div v-if="metricNoteFor(selectedServer)" class="metric-note"><CircleAlert :size="15" /> {{ metricNoteFor(selectedServer) }}</div><div v-else-if="!selected?.metric" class="empty-inline">采集的是当前快照，不安装 Agent，也不会读取当前目录中的私钥。</div></section>
+            <section class="panel inventory-summary-panel"><div class="panel-heading"><div><h2>项目盘点</h2><p>{{ selected?.inventory ? humanTime(selected.inventory.collectedAt) : '尚未盘点' }}</p></div><FolderKanban :size="20" /></div><div v-if="selected?.inventory" class="inventory-summary"><div><span>项目清单</span><strong>{{ selected.inventory.projects.length }}</strong></div><div><span>运行服务</span><strong>{{ selected.inventory.services.length }}</strong></div><div><span>监听端口</span><strong>{{ selected.inventory.listeningPorts.length }}</strong></div><p v-if="selected.inventory.warnings.length"><CircleAlert :size="14" /> {{ selected.inventory.warnings[0] }}</p></div><div v-else class="empty-inline">点击上方盘点按钮，读取 Docker、systemd、端口和项目清单并同步到项目档案。</div></section>
             <section class="panel session-panel"><div class="panel-heading"><div><h2>AI 会话租约</h2><p>同一 VPS 同时只允许一个执行会话</p></div><ShieldCheck :size="20" /></div><div v-if="selectedServerSession" class="session-summary"><div class="session-summary-top"><span :class="['status-badge', sessionStatusOf(selectedServerSession.status).tone]">{{ sessionStatusOf(selectedServerSession.status).label }}</span><strong>{{ selectedServerSession.requester }}</strong><small v-if="selectedServerSession.status === 'queued'">排队第 {{ selectedServerSession.queuePosition }} 位</small></div><dl class="property-list"><div><dt>空闲释放</dt><dd>{{ selectedServerSession.idleExpiresAt ? humanTime(selectedServerSession.idleExpiresAt) : '获得租约后开始' }}</dd></div><div><dt>最长租期</dt><dd>{{ humanTime(selectedServerSession.maxExpiresAt) }}</dd></div><div><dt>会话 ID</dt><dd class="mono-value">{{ selectedServerSession.id }}</dd></div></dl><div v-if="selectedSession?.commands.length" class="session-command-list"><div v-for="command in selectedSession.commands.slice(0, 5)" :key="command.id"><span :class="['risk-label', command.risk]">{{ commandRiskLabel(command.risk) }}</span><code>{{ command.command }}</code><small>{{ commandOutcomeLabel(command.outcome) }} · {{ humanTime(command.createdAt) }}</small></div></div></div><div v-else class="empty-inline">当前没有占用或排队中的 AI 会话</div></section>
-            <section class="panel inventory-panel"><div class="panel-heading"><div><h2>连接资料</h2><p>仅保存引用，不保存秘密</p></div><Terminal :size="20" /></div><dl class="property-list"><div><dt>环境</dt><dd>{{ selectedServer.environment }}</dd></div><div><dt>数据来源</dt><dd>{{ selectedServer.source === 'all-vps' ? 'all-vps 文档同步' : '手动登记' }}</dd></div><div><dt>凭据引用</dt><dd>{{ selectedServer.credentialRef ?? '未关联' }}</dd></div><div v-if="selectedServer.sshUser === 'root'"><dt>root 访问</dt><dd :class="emergencyRootActive(selectedServer) ? 'root-grant-active' : 'root-grant-missing'">{{ emergencyRootActive(selectedServer) ? `有效至 ${humanTime(selectedServer.emergencyRootUntil)}` : '未启用，点击上方按钮可启用 8 小时' }}</dd></div><div><dt>标签</dt><dd><span v-if="selectedServer.tags.length" class="tag-list"><b v-for="tag in selectedServer.tags" :key="tag">{{ tag }}</b></span><span v-else>无</span></dd></div><div><dt>维护状态</dt><dd>{{ selectedServer.maintenance ? '已开启' : '正常' }}</dd></div></dl></section>
+            <section class="panel inventory-panel"><div class="panel-heading"><div><h2>连接资料</h2><p>仅保存引用，不保存秘密</p></div><Terminal :size="20" /></div><dl class="property-list"><div><dt>环境</dt><dd>{{ selectedServer.environment }}</dd></div><div><dt>数据来源</dt><dd>{{ selectedServer.source === 'all-vps' ? 'all-vps 文档同步' : '手动登记' }}</dd></div><div><dt>SSH 网络</dt><dd>{{ selectedServer.networkMode === 'direct' ? '直连物理网卡' : '系统路由' }}</dd></div><div><dt>凭据引用</dt><dd>{{ selectedServer.credentialRef ?? '未关联' }}</dd></div><div v-if="selectedServer.sshUser === 'root'"><dt>root 访问</dt><dd :class="emergencyRootActive(selectedServer) ? 'root-grant-active' : 'root-grant-missing'">{{ emergencyRootActive(selectedServer) ? `有效至 ${humanTime(selectedServer.emergencyRootUntil)}` : '未启用，点击上方按钮可启用 8 小时' }}</dd></div><div><dt>标签</dt><dd><span v-if="selectedServer.tags.length" class="tag-list"><b v-for="tag in selectedServer.tags" :key="tag">{{ tag }}</b></span><span v-else>无</span></dd></div><div><dt>维护状态</dt><dd>{{ selectedServer.maintenance ? '已开启' : '正常' }}</dd></div></dl></section>
             <section class="panel history-panel"><div class="panel-heading"><div><h2>健康历史</h2><p>最近 {{ selected?.events.length ?? 0 }} 次</p></div><Clock3 :size="20" /></div><div v-if="selected?.events.length" class="timeline"><div v-for="event in selected.events.slice(0, 8)" :key="event.id"><span :class="['status-dot', statusOf(event.status).tone]"></span><strong>{{ statusOf(event.status).label }}</strong><time>{{ humanTime(event.checkedAt) }}</time><p v-if="event.error">{{ event.error }}</p></div></div><div v-else class="empty-inline">尚无健康历史</div></section>
           </div>
         </template>
@@ -785,7 +965,7 @@ onMounted(() => void refresh());
     <div v-if="showEditor" class="modal-backdrop" @mousedown.self="showEditor = false">
       <form class="editor-modal" @submit.prevent="saveServer">
         <header><div><p class="eyebrow">{{ isEditing ? '编辑资产' : '手动登记' }}</p><h2>{{ isEditing ? '更新 VPS' : '添加 VPS' }}</h2></div><button class="icon-button" type="button" title="关闭" @click="showEditor = false"><X :size="18" /></button></header>
-        <div class="form-grid"><label class="full"><span>显示名称</span><input v-model="form.name" required maxlength="80" placeholder="例如：大阪主站" /></label><label><span>地址</span><input v-model="form.address" required maxlength="253" placeholder="IP 或主机名" /></label><label><span>SSH 端口</span><input v-model.number="form.sshPort" required type="number" min="1" max="65535" /></label><label><span>SSH 用户</span><input v-model="form.sshUser" required maxlength="80" placeholder="ubuntu" /></label><label><span>环境</span><input v-model="form.environment" required maxlength="40" placeholder="production" /></label><label class="full"><span>用途 / 角色</span><input v-model="form.role" maxlength="100" placeholder="例如：Web、数据库、代理节点" /></label><label class="full"><span>访问地址</span><input v-model="form.accessUrl" type="url" placeholder="https://example.com" /></label><label><span>凭据引用</span><input v-model="form.credentialRef" maxlength="160" placeholder="仅名称，不输入路径或私钥" /></label><label><span>标签</span><input v-model="form.tags" maxlength="200" placeholder="逗号分隔，例如：docker, asia" /></label></div>
+        <div class="form-grid"><label class="full"><span>显示名称</span><input v-model="form.name" required maxlength="80" placeholder="例如：大阪主站" /></label><label><span>地址</span><input v-model="form.address" required maxlength="253" placeholder="IP 或主机名" /></label><label><span>SSH 端口</span><input v-model.number="form.sshPort" required type="number" min="1" max="65535" /></label><label><span>SSH 用户</span><input v-model="form.sshUser" required maxlength="80" placeholder="ubuntu" /></label><label><span>SSH 网络路径</span><select v-model="form.networkMode"><option value="system">系统路由</option><option value="direct">直连物理网卡（绕过 TUN）</option></select></label><label><span>环境</span><input v-model="form.environment" required maxlength="40" placeholder="production" /></label><label class="full"><span>用途 / 角色</span><input v-model="form.role" maxlength="100" placeholder="例如：Web、数据库、代理节点" /></label><label class="full"><span>访问地址</span><input v-model="form.accessUrl" type="url" placeholder="https://example.com" /></label><label><span>凭据引用</span><input v-model="form.credentialRef" maxlength="160" placeholder="仅名称，不输入路径或私钥" /></label><label><span>标签</span><input v-model="form.tags" maxlength="200" placeholder="逗号分隔，例如：docker, asia" /></label></div>
         <label class="switch-row"><input v-model="form.addHttpCheck" type="checkbox" /><span><strong>附加 HTTP 健康检查</strong><small>按指定状态码判断，不将 Ping 作为前提。</small></span></label>
         <div v-if="form.addHttpCheck" class="form-grid check-fields"><label class="full"><span>健康检查 URL</span><input v-model="form.healthUrl" required type="url" placeholder="https://example.com/health" /></label><label class="full"><span>预期状态码</span><input v-model="form.expectedStatusCodes" required placeholder="200, 301, 404" /></label></div>
         <label class="switch-row"><input v-model="form.maintenance" type="checkbox" /><span><strong>维护模式</strong><small>保留资产，但探针显示为维护中。</small></span></label>

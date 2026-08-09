@@ -11,12 +11,14 @@ import type {
   CommandRunRecord,
   CreateProjectInput,
   CreateServerInput,
+  DiscoveredProjectInput,
   DashboardSummary,
   HealthCheck,
   ImportedServerInput,
   ImportSyncPreview,
   ImportSyncResult,
   MetricSnapshot,
+  InventorySyncAction,
   ProjectDetail,
   ProjectRecord,
   ProjectRunbook,
@@ -25,6 +27,7 @@ import type {
   ProjectService,
   ProjectServiceInput,
   ProbeResult,
+  ServerInventory,
   ServerRecord,
   ServerSource,
   ServerStatus,
@@ -46,6 +49,7 @@ interface RawServer {
   address: string;
   ssh_port: number;
   ssh_user: string;
+  network_mode: string;
   credential_ref: string | null;
   emergency_root_until: string | null;
   role: string;
@@ -91,6 +95,12 @@ interface RawMetric {
   note: string | null;
 }
 
+interface RawInventory {
+  server_id: string;
+  collected_at: string;
+  inventory_json: string;
+}
+
 interface RawSession {
   id: string;
   server_id: string;
@@ -128,6 +138,9 @@ interface RawCommandRun {
 
 interface RawProject {
   id: string;
+  source: string;
+  source_key: string | null;
+  source_synced_at: string | null;
   name: string;
   description: string;
   repository_url: string | null;
@@ -205,6 +218,7 @@ function toServer(raw: RawServer, healthChecks: HealthCheck[]): ServerRecord {
     address: raw.address,
     sshPort: raw.ssh_port,
     sshUser: raw.ssh_user,
+    networkMode: raw.network_mode === "direct" ? "direct" : "system",
     credentialRef: raw.credential_ref,
     emergencyRootUntil: raw.emergency_root_until,
     role: raw.role,
@@ -278,6 +292,9 @@ function toCommandRun(raw: RawCommandRun): CommandRunRecord {
 function toProject(raw: RawProject): ProjectRecord {
   return {
     id: raw.id,
+    source: raw.source === "remote-inventory" ? "remote-inventory" : "manual",
+    sourceKey: raw.source_key,
+    sourceSyncedAt: raw.source_synced_at,
     name: raw.name,
     description: raw.description,
     repositoryUrl: raw.repository_url,
@@ -344,6 +361,7 @@ export class GatewayDatabase {
         address TEXT NOT NULL,
         ssh_port INTEGER NOT NULL,
         ssh_user TEXT NOT NULL,
+        network_mode TEXT NOT NULL DEFAULT 'system',
         credential_ref TEXT,
         emergency_root_until TEXT,
         role TEXT NOT NULL DEFAULT '',
@@ -387,6 +405,13 @@ export class GatewayDatabase {
         load1 REAL,
         source TEXT NOT NULL,
         note TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS server_inventories (
+        id TEXT PRIMARY KEY,
+        server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+        collected_at TEXT NOT NULL,
+        inventory_json TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS audit_events (
@@ -433,6 +458,9 @@ export class GatewayDatabase {
 
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
+        source TEXT NOT NULL DEFAULT 'manual',
+        source_key TEXT,
+        source_synced_at TEXT,
         name TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
         repository_url TEXT,
@@ -472,11 +500,19 @@ export class GatewayDatabase {
     this.addServerColumnIfMissing("source_key TEXT");
     this.addServerColumnIfMissing("source_synced_at TEXT");
     this.addServerColumnIfMissing("emergency_root_until TEXT");
+    this.addServerColumnIfMissing("network_mode TEXT NOT NULL DEFAULT 'system'");
+    this.addProjectColumnIfMissing("source TEXT NOT NULL DEFAULT 'manual'");
+    this.addProjectColumnIfMissing("source_key TEXT");
+    this.addProjectColumnIfMissing("source_synced_at TEXT");
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_source_key
         ON servers(source_key) WHERE source_key IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_health_events_server_time
         ON health_events(server_id, checked_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_metrics_server_time
+        ON metrics(server_id, collected_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_server_inventories_time
+        ON server_inventories(server_id, collected_at DESC);
       CREATE INDEX IF NOT EXISTS idx_audit_events_time
         ON audit_events(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_sessions_server_status
@@ -487,6 +523,8 @@ export class GatewayDatabase {
         ON command_runs(session_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_projects_active
         ON projects(archived_at, name COLLATE NOCASE);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_source_key
+        ON projects(source, source_key) WHERE source_key IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_project_servers_server
         ON project_servers(server_id);
       CREATE INDEX IF NOT EXISTS idx_project_services_project
@@ -497,6 +535,16 @@ export class GatewayDatabase {
   private addServerColumnIfMissing(definition: string): void {
     try {
       this.db.exec(`ALTER TABLE servers ADD COLUMN ${definition}`);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes("duplicate column name")) {
+        throw error;
+      }
+    }
+  }
+
+  private addProjectColumnIfMissing(definition: string): void {
+    try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN ${definition}`);
     } catch (error) {
       if (!(error instanceof Error) || !error.message.includes("duplicate column name")) {
         throw error;
@@ -546,9 +594,9 @@ export class GatewayDatabase {
     this.db
       .prepare(`
         INSERT INTO servers
-          (id, source, source_key, source_synced_at, name, address, ssh_port, ssh_user, credential_ref, role, environment,
+          (id, source, source_key, source_synced_at, name, address, ssh_port, ssh_user, network_mode, credential_ref, role, environment,
            access_url, tags_json, maintenance, status, created_at, updated_at)
-        VALUES (?, 'manual', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?)
+        VALUES (?, 'manual', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?)
       `)
       .run(
         id,
@@ -556,6 +604,7 @@ export class GatewayDatabase {
         input.address,
         input.sshPort,
         input.sshUser,
+        input.networkMode ?? "system",
         input.credentialRef ?? null,
         input.role ?? "",
         input.environment ?? "production",
@@ -577,6 +626,7 @@ export class GatewayDatabase {
       address: patch.address ?? existing.address,
       sshPort: patch.sshPort ?? existing.sshPort,
       sshUser: patch.sshUser ?? existing.sshUser,
+      networkMode: patch.networkMode ?? existing.networkMode,
       credentialRef: patch.credentialRef === undefined ? existing.credentialRef : patch.credentialRef,
       role: patch.role ?? existing.role,
       environment: patch.environment ?? existing.environment,
@@ -588,7 +638,7 @@ export class GatewayDatabase {
     this.db
       .prepare(`
         UPDATE servers SET name = ?, address = ?, ssh_port = ?, ssh_user = ?,
-          credential_ref = ?, role = ?, environment = ?, access_url = ?, tags_json = ?,
+          network_mode = ?, credential_ref = ?, role = ?, environment = ?, access_url = ?, tags_json = ?,
           maintenance = ?, updated_at = ? WHERE id = ?
       `)
       .run(
@@ -596,6 +646,7 @@ export class GatewayDatabase {
         next.address,
         next.sshPort,
         next.sshUser,
+        next.networkMode,
         next.credentialRef ?? null,
         next.role,
         next.environment,
@@ -668,9 +719,9 @@ export class GatewayDatabase {
       this.db
         .prepare(`
           INSERT INTO servers
-            (id, source, source_key, source_synced_at, name, address, ssh_port, ssh_user, credential_ref,
+            (id, source, source_key, source_synced_at, name, address, ssh_port, ssh_user, network_mode, credential_ref,
              role, environment, access_url, tags_json, maintenance, status, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'unknown', ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'unknown', ?, ?)
         `)
         .run(
           id,
@@ -681,6 +732,7 @@ export class GatewayDatabase {
           desired.address,
           desired.sshPort,
           desired.sshUser,
+          desired.networkMode ?? "system",
           desired.role ?? "",
           desired.environment ?? "production",
           desired.accessUrl ?? null,
@@ -1094,8 +1146,8 @@ export class GatewayDatabase {
       this.db
         .prepare(`
           INSERT INTO projects
-            (id, name, description, repository_url, repository_path, runbook_json, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, source, source_key, source_synced_at, name, description, repository_url, repository_path, runbook_json, created_at, updated_at)
+          VALUES (?, 'manual', NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           id,
@@ -1147,6 +1199,87 @@ export class GatewayDatabase {
       if (patch.servers !== undefined) this.replaceProjectServers(projectId, nextServers);
       if (patch.services !== undefined) this.replaceProjectServices(projectId, nextServices, timestamp);
       return this.getProject(projectId) as ProjectDetail;
+    });
+  }
+
+  syncDiscoveredProject(input: DiscoveredProjectInput): { action: InventorySyncAction; project: ProjectDetail } {
+    const servers: ProjectServerInput[] = [{ serverId: input.serverId, role: "运行节点" }];
+    const services = input.services ?? [];
+    this.assertProjectResources(servers, services);
+    const existingRow = this.db
+      .prepare("SELECT id FROM projects WHERE source = 'remote-inventory' AND source_key = ?")
+      .get(input.sourceKey) as unknown as { id: string } | undefined;
+    const timestamp = now();
+    if (!existingRow) {
+      const id = randomUUID();
+      this.transaction(() => {
+        this.db
+          .prepare(`
+            INSERT INTO projects
+              (id, source, source_key, source_synced_at, name, description, repository_url, repository_path, runbook_json, created_at, updated_at)
+            VALUES (?, 'remote-inventory', ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+          `)
+          .run(
+            id,
+            input.sourceKey,
+            timestamp,
+            input.name,
+            input.description,
+            input.repositoryPath ?? null,
+            JSON.stringify(input.runbook),
+            timestamp,
+            timestamp
+          );
+        this.replaceProjectServers(id, servers);
+        this.replaceProjectServices(id, services, timestamp);
+      });
+      return { action: "created", project: this.getProject(id) as ProjectDetail };
+    }
+
+    const existing = this.getProject(existingRow.id, true);
+    if (!existing) throw new Error(`自动发现项目不存在：${input.sourceKey}`);
+    const sameServices = JSON.stringify(existing.services.map((service) => ({
+      serverId: service.serverId,
+      name: service.name,
+      manager: service.manager,
+      identifier: service.identifier,
+      port: service.port,
+      accessUrl: service.accessUrl,
+      critical: service.critical,
+      notes: service.notes
+    }))) === JSON.stringify(services);
+    const unchanged = existing.name === input.name &&
+      existing.description === input.description &&
+      existing.repositoryPath === (input.repositoryPath ?? null) &&
+      JSON.stringify(existing.runbook) === JSON.stringify(input.runbook) &&
+      sameServices &&
+      existing.archivedAt === null;
+
+    this.transaction(() => {
+      this.db
+        .prepare(`
+          UPDATE projects SET source_synced_at = ?, name = ?, description = ?, repository_path = ?, runbook_json = ?,
+            archived_at = NULL, updated_at = ? WHERE id = ?
+        `)
+        .run(timestamp, input.name, input.description, input.repositoryPath ?? null, JSON.stringify(input.runbook), timestamp, existing.id);
+      this.replaceProjectServers(existing.id, servers);
+      this.replaceProjectServices(existing.id, services, timestamp);
+    });
+    return { action: unchanged ? "unchanged" : "updated", project: this.getProject(existing.id) as ProjectDetail };
+  }
+
+  archiveMissingDiscoveredProjects(serverId: string, activeSourceKeys: string[]): number {
+    const activeKeys = new Set(activeSourceKeys);
+    const rows = this.db
+      .prepare("SELECT id, source_key FROM projects WHERE source = 'remote-inventory' AND archived_at IS NULL AND source_key LIKE ?")
+      .all(`${serverId}:%`) as unknown as Array<{ id: string; source_key: string }>;
+    const stale = rows.filter((row) => !activeKeys.has(row.source_key));
+    if (!stale.length) return 0;
+    const timestamp = now();
+    return this.transaction(() => {
+      const update = this.db.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?");
+      for (const row of stale) update.run(timestamp, timestamp, row.id);
+      return stale.length;
     });
   }
 
@@ -1253,6 +1386,21 @@ export class GatewayDatabase {
       );
   }
 
+  saveInventory(inventory: ServerInventory): void {
+    this.db
+      .prepare("INSERT INTO server_inventories (id, server_id, collected_at, inventory_json) VALUES (?, ?, ?, ?)")
+      .run(randomUUID(), inventory.serverId, inventory.collectedAt, JSON.stringify(inventory));
+  }
+
+  latestInventory(serverId: string): ServerInventory | null {
+    const row = this.db
+      .prepare("SELECT server_id, collected_at, inventory_json FROM server_inventories WHERE server_id = ? ORDER BY collected_at DESC LIMIT 1")
+      .get(serverId) as unknown as RawInventory | undefined;
+    if (!row) return null;
+    const inventory = parseJson<ServerInventory | null>(row.inventory_json, null);
+    return inventory ? { ...inventory, serverId: row.server_id, collectedAt: row.collected_at } : null;
+  }
+
   pruneCommandRuns(before: string): number {
     const result = this.db
       .prepare("DELETE FROM command_runs WHERE finished_at IS NOT NULL AND finished_at < ?")
@@ -1260,11 +1408,33 @@ export class GatewayDatabase {
     return Number(result.changes);
   }
 
+  pruneMetrics(before: string): number {
+    const result = this.db.prepare("DELETE FROM metrics WHERE collected_at < ?").run(before);
+    return Number(result.changes);
+  }
+
   latestMetric(serverId: string): MetricSnapshot | null {
     const row = this.db
       .prepare("SELECT server_id, collected_at, cpu_percent, memory_percent, disk_percent, load1, source, note FROM metrics WHERE server_id = ? ORDER BY collected_at DESC LIMIT 1")
       .get(serverId) as unknown as RawMetric | undefined;
-    if (!row) return null;
+    return row ? this.toMetric(row) : null;
+  }
+
+  metricHistory(serverId: string, limit = 48, since?: string): MetricSnapshot[] {
+    const safeLimit = Math.min(Math.max(Math.trunc(limit), 1), 240);
+    const rows = this.db
+      .prepare(`
+        SELECT server_id, collected_at, cpu_percent, memory_percent, disk_percent, load1, source, note
+        FROM metrics
+        WHERE server_id = ? AND (? IS NULL OR collected_at >= ?)
+        ORDER BY collected_at DESC
+        LIMIT ?
+      `)
+      .all(serverId, since ?? null, since ?? null, safeLimit) as unknown as RawMetric[];
+    return rows.map((row) => this.toMetric(row)).reverse();
+  }
+
+  private toMetric(row: RawMetric): MetricSnapshot {
     return {
       serverId: row.server_id,
       collectedAt: row.collected_at,
@@ -1305,6 +1475,22 @@ export class GatewayDatabase {
     const rows = this.db
       .prepare("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT ?")
       .all(Math.min(Math.max(limit, 1), 200)) as unknown as RawAuditEvent[];
+    return rows.map((row) => ({
+      id: row.id,
+      createdAt: row.created_at,
+      action: row.action,
+      targetType: row.target_type,
+      targetId: row.target_id,
+      severity: row.severity,
+      summary: row.summary,
+      metadata: parseJson<Record<string, unknown>>(row.metadata_json, {})
+    }));
+  }
+
+  recentMetricAlerts(limit = 30): AuditEvent[] {
+    const rows = this.db
+      .prepare("SELECT * FROM audit_events WHERE action = ? ORDER BY created_at DESC LIMIT ?")
+      .all("metrics.alert", Math.min(Math.max(limit, 1), 200)) as unknown as RawAuditEvent[];
     return rows.map((row) => ({
       id: row.id,
       createdAt: row.created_at,

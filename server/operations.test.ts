@@ -143,4 +143,99 @@ load1=0.42
     assert.match(metric.note ?? "", /尚未配置/);
     database.close();
   });
+
+  it("records one alert when a metric crosses a threshold and deduplicates repeats", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-metric-alert-"));
+    temporaryDirectories.push(directory);
+    const credentials = join(directory, "credentials");
+    mkdirSync(credentials);
+    writeFileSync(join(credentials, "test-key"), "test");
+    const knownHosts = join(directory, "known_hosts");
+    writeFileSync(knownHosts, "[203.0.113.53]:22 ssh-ed25519 test\n");
+    const fakeBinary = join(directory, "high-metrics-ssh.sh");
+    writeFileSync(
+      fakeBinary,
+      `#!/bin/sh
+printf '%s' 'cpu_percent=95
+memory_percent=91
+disk_percent=86
+load1=2.4
+'
+`
+    );
+    chmodSync(fakeBinary, 0o755);
+    const store = new CredentialStore(credentials, knownHosts);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "告警测试节点", address: "203.0.113.53", sshPort: 22, sshUser: "ubuntu", credentialRef: "test-key" });
+    const operations = new GatewayOperations(database, { sshExecutor: new SshExecutor({ credentialStore: store, sshBinary: fakeBinary }), idleTimeoutMs: 60_000, maxSessionDurationMs: 600_000 });
+
+    await operations.collectMetrics(server.id);
+    await operations.collectMetrics(server.id);
+    assert.equal(database.recentMetricAlerts().length, 1);
+    assert.match(database.recentMetricAlerts()[0]?.summary ?? "", /CPU 高/);
+    database.close();
+  });
+
+  it("binds direct SSH assets to the physical interface without proxy hops", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-direct-ssh-"));
+    temporaryDirectories.push(directory);
+    const credentials = join(directory, "credentials");
+    mkdirSync(credentials);
+    writeFileSync(join(credentials, "test-key"), "test");
+    const knownHosts = join(directory, "known_hosts");
+    writeFileSync(knownHosts, "[203.0.113.54]:22 ssh-ed25519 test\n");
+    const fakeBinary = join(directory, "capture-ssh.sh");
+    writeFileSync(fakeBinary, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+    chmodSync(fakeBinary, 0o755);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "直连测试节点", address: "203.0.113.54", sshPort: 22, sshUser: "ubuntu", networkMode: "direct", credentialRef: "test-key" });
+    const executor = new SshExecutor({ credentialStore: new CredentialStore(credentials, knownHosts), sshBinary: fakeBinary, directInterface: "en0" });
+
+    const result = await executor.execute(server, "true");
+    assert.equal(result.exitCode, 0);
+    assert.match(result.stdout, /BindInterface=en0/);
+    assert.match(result.stdout, /ProxyCommand=none/);
+    assert.match(result.stdout, /ProxyJump=none/);
+    database.close();
+  });
+
+  it("does not inherit proxy environment variables into SSH", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-no-proxy-"));
+    temporaryDirectories.push(directory);
+    const credentials = join(directory, "credentials");
+    mkdirSync(credentials);
+    writeFileSync(join(credentials, "test-key"), "test");
+    const knownHosts = join(directory, "known_hosts");
+    writeFileSync(knownHosts, "[203.0.113.55]:22 ssh-ed25519 test\n");
+    const fakeBinary = join(directory, "capture-ssh-environment.sh");
+    writeFileSync(
+      fakeBinary,
+      "#!/bin/sh\nprintf 'http_proxy=%s\\n' \"${HTTP_PROXY-}\"\nprintf 'https_proxy=%s\\n' \"${HTTPS_PROXY-}\"\nprintf 'all_proxy=%s\\n' \"${ALL_PROXY-}\"\n"
+    );
+    chmodSync(fakeBinary, 0o755);
+    const previousEnvironment = {
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      HTTPS_PROXY: process.env.HTTPS_PROXY,
+      ALL_PROXY: process.env.ALL_PROXY
+    };
+    process.env.HTTP_PROXY = "http://gateway-test-proxy.invalid:8080";
+    process.env.HTTPS_PROXY = "http://gateway-test-proxy.invalid:8080";
+    process.env.ALL_PROXY = "socks5://gateway-test-proxy.invalid:1080";
+
+    try {
+      const database = new GatewayDatabase(directory);
+      const server = database.createServer({ name: "无代理测试节点", address: "203.0.113.55", sshPort: 22, sshUser: "ubuntu", credentialRef: "test-key" });
+      const executor = new SshExecutor({ credentialStore: new CredentialStore(credentials, knownHosts), sshBinary: fakeBinary });
+      const result = await executor.execute(server, "true");
+      assert.equal(result.exitCode, 0);
+      assert.doesNotMatch(result.stdout, /gateway-test-proxy/);
+      assert.match(result.stdout, /http_proxy=\nhttps_proxy=\nall_proxy=\n/);
+      database.close();
+    } finally {
+      for (const [key, value] of Object.entries(previousEnvironment)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
 });

@@ -22,6 +22,13 @@ AI VPS Gateway is designed for a single local operator. It binds its API to
   expiry events are auditable; individual commands do not require confirmation.
 - The command policy is a conservative denylist and warning layer. It is not a
   complete sandbox for arbitrary shell syntax or obfuscated commands.
+- SSH starts with a clean environment, disables `ProxyCommand` and `ProxyJump`,
+  and supports binding a selected server to a physical interface. This is a
+  routing control for the local gateway, not a guarantee that every operating
+  system-level TUN route is changed.
+- Remote project inventory is metadata-only and bounded. It must not be
+  expanded to read configuration contents, environment variables, logs, or
+  credentials without a separate security review.
 
 ## Reporting a vulnerability
 

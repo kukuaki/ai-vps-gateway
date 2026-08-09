@@ -1,7 +1,11 @@
 import type {
   AllVpsSyncPreview,
+  AllMetricsResponse,
+  AlertResponse,
   AuditEvent,
   DashboardResponse,
+  AllVpsProjectSyncResponse,
+  MetricHistoryResponse,
   ProjectDetail,
   ProjectPayload,
   ProjectRecord,
@@ -9,7 +13,8 @@ import type {
   ServerPayload,
   ServerRecord,
   SessionDetail,
-  SessionRecord
+  SessionRecord,
+  ServerProjectSyncResult
 } from "./types";
 
 interface ApiErrorPayload {
@@ -35,6 +40,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   dashboard: () => request<DashboardResponse>("/api/dashboard"),
   server: (id: string) => request<ServerDetail>(`/api/servers/${id}`),
+  metricHistory: (id: string, limit = 48, hours = 24 * 7) => request<MetricHistoryResponse>(`/api/servers/${id}/metrics/history?limit=${limit}&hours=${hours}`),
+  alerts: (limit = 30) => request<AlertResponse>(`/api/alerts?limit=${limit}`),
   audit: () => request<{ events: AuditEvent[] }>("/api/audit"),
   createServer: (payload: ServerPayload) => request<{ server: ServerRecord }>("/api/servers", { method: "POST", body: JSON.stringify(payload) }),
   updateServer: (id: string, payload: ServerPayload) =>
@@ -49,6 +56,9 @@ export const api = {
   runCommand: (id: string, command: string, timeoutMs?: number) => request<{ result: unknown; session: SessionDetail | null }>(`/api/sessions/${id}/commands`, { method: "POST", body: JSON.stringify({ command, timeoutMs }) }),
   closeSession: (id: string, reason = "closed_from_webui") => request<{ session: SessionRecord; promoted: SessionRecord | null }>(`/api/sessions/${id}/close`, { method: "POST", body: JSON.stringify({ reason }) }),
   collectMetrics: (serverId: string, sessionId?: string) => request<{ metric: ServerDetail["metric"] }>(`/api/servers/${serverId}/metrics`, { method: "POST", body: JSON.stringify({ sessionId }) }),
+  collectAllMetrics: () => request<AllMetricsResponse>("/api/metrics/all", { method: "POST" }),
+  syncServerProjects: (serverId: string, sessionId?: string) => request<ServerProjectSyncResult>(`/api/servers/${serverId}/inventory/sync-projects`, { method: "POST", body: JSON.stringify({ sessionId }) }),
+  syncAllVpsProjects: () => request<AllVpsProjectSyncResponse>("/api/inventory/all-vps/sync-projects", { method: "POST" }),
   projects: () => request<{ projects: ProjectRecord[] }>("/api/projects"),
   project: (id: string) => request<{ project: ProjectDetail }>(`/api/projects/${id}`),
   createProject: (payload: ProjectPayload) => request<{ project: ProjectDetail }>("/api/projects", { method: "POST", body: JSON.stringify(payload) }),

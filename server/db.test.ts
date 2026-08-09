@@ -46,4 +46,37 @@ describe("GatewayDatabase", () => {
     assert.equal(database.getServer(created.id), null);
     database.close();
   });
+
+  it("returns metric history in chronological order with a bounded limit", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-db-metrics-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "指标节点", address: "203.0.113.20", sshPort: 22, sshUser: "ubuntu" });
+    database.saveMetric({
+      serverId: server.id,
+      collectedAt: "2026-08-09T00:00:00.000Z",
+      cpuPercent: 10,
+      memoryPercent: 20,
+      diskPercent: 30,
+      load1: 0.1,
+      source: "ssh",
+      note: null
+    });
+    database.saveMetric({
+      serverId: server.id,
+      collectedAt: "2026-08-09T00:01:00.000Z",
+      cpuPercent: 40,
+      memoryPercent: 50,
+      diskPercent: 60,
+      load1: 0.4,
+      source: "ssh",
+      note: null
+    });
+
+    const history = database.metricHistory(server.id, 1);
+    assert.equal(history.length, 1);
+    assert.equal(history[0]?.cpuPercent, 40);
+    assert.equal(database.metricHistory(server.id, 10)[0]?.collectedAt, "2026-08-09T00:00:00.000Z");
+    database.close();
+  });
 });

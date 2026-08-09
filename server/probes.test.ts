@@ -75,4 +75,22 @@ describe("network probes", () => {
     assert.equal(result.ok, true);
     assert.equal(result.statusCode, 200);
   });
+
+  it("can keep the HTTP host name while connecting to a direct server address", async () => {
+    const port = await listenHttp((request, response) => {
+      assert.equal(request.headers.host, `direct.example:${port}`);
+      response.writeHead(200);
+      response.end("ok");
+    });
+    const result = await probeHttp({
+      id: "direct-check",
+      serverId: "test-server",
+      name: "Direct health endpoint",
+      kind: "http",
+      enabled: true,
+      config: { url: `http://direct.example:${port}/health`, expectedStatusCodes: [200] }
+    }, undefined, "127.0.0.1");
+    assert.equal(result.ok, true);
+    assert.equal(result.statusCode, 200);
+  });
 });

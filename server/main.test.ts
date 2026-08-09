@@ -30,11 +30,23 @@ describe("local API", () => {
         address: "203.0.113.11",
         sshPort: 22,
         sshUser: "ubuntu",
+        role: "Web",
+        tags: ["test"],
         healthChecks: []
       }
     });
     assert.equal(createdResponse.statusCode, 201);
     const created = createdResponse.json() as { server: { id: string } };
+
+    const routeResponse = await app.inject({
+      method: "PATCH",
+      url: `/api/servers/${created.server.id}`,
+      payload: { networkMode: "direct" }
+    });
+    assert.equal(routeResponse.statusCode, 200);
+    assert.equal(routeResponse.json().server.networkMode, "direct");
+    assert.equal(routeResponse.json().server.sshUser, "ubuntu");
+    assert.deepEqual(routeResponse.json().server.tags, ["test"]);
 
     const listResponse = await app.inject({ method: "GET", url: "/api/servers" });
     assert.equal(listResponse.statusCode, 200);
@@ -138,6 +150,34 @@ describe("local API", () => {
     const archiveResponse = await app.inject({ method: "POST", url: `/api/projects/${project.project.id}/archive` });
     assert.equal(archiveResponse.statusCode, 200);
     assert.equal(database.listProjects().length, 0);
+    await app.close();
+  });
+
+  it("serves metric history and performance alerts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-metrics-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const app = await buildApp(database);
+    await app.ready();
+    const server = database.createServer({ name: "性能 API 节点", address: "203.0.113.31", sshPort: 22, sshUser: "ubuntu" });
+    database.saveMetric({
+      serverId: server.id,
+      collectedAt: "2026-08-09T00:00:00.000Z",
+      cpuPercent: 12,
+      memoryPercent: 34,
+      diskPercent: 45,
+      load1: 0.2,
+      source: "ssh",
+      note: null
+    });
+    database.audit("metrics.alert", "server", server.id, "性能告警：性能 API 节点 · CPU 高", "warning", { serverId: server.id });
+
+    const historyResponse = await app.inject({ method: "GET", url: `/api/servers/${server.id}/metrics/history?limit=10&hours=720` });
+    assert.equal(historyResponse.statusCode, 200);
+    assert.equal(historyResponse.json().metrics.length, 1);
+    const alertsResponse = await app.inject({ method: "GET", url: "/api/alerts?limit=10" });
+    assert.equal(alertsResponse.statusCode, 200);
+    assert.equal(alertsResponse.json().alerts[0].summary, "性能告警：性能 API 节点 · CPU 高");
     await app.close();
   });
 

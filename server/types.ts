@@ -11,6 +11,8 @@ export const SERVER_STATUSES = [
 export type ServerStatus = (typeof SERVER_STATUSES)[number];
 export const SERVER_SOURCES = ["manual", "all-vps"] as const;
 export type ServerSource = (typeof SERVER_SOURCES)[number];
+export const SSH_NETWORK_MODES = ["system", "direct"] as const;
+export type SshNetworkMode = (typeof SSH_NETWORK_MODES)[number];
 export type HealthCheckKind = "http" | "tcp";
 export type AuditSeverity = "info" | "warning" | "critical";
 export const SERVICE_MANAGERS = ["docker", "systemd", "process", "external"] as const;
@@ -47,6 +49,7 @@ export interface ServerRecord {
   address: string;
   sshPort: number;
   sshUser: string;
+  networkMode: SshNetworkMode;
   credentialRef: string | null;
   emergencyRootUntil: string | null;
   role: string;
@@ -67,6 +70,7 @@ export interface CreateServerInput {
   address: string;
   sshPort: number;
   sshUser: string;
+  networkMode?: SshNetworkMode;
   credentialRef?: string | null;
   role?: string;
   environment?: string;
@@ -91,6 +95,9 @@ export interface ProjectRunbook {
   guardrails: string;
 }
 
+export const PROJECT_SOURCES = ["manual", "remote-inventory"] as const;
+export type ProjectSource = (typeof PROJECT_SOURCES)[number];
+
 export interface ProjectServerInput {
   serverId: string;
   role?: string;
@@ -107,6 +114,16 @@ export interface ProjectServiceInput {
   notes?: string;
 }
 
+export interface DiscoveredProjectInput {
+  sourceKey: string;
+  name: string;
+  description: string;
+  repositoryPath?: string | null;
+  serverId: string;
+  runbook: ProjectRunbook;
+  services?: ProjectServiceInput[];
+}
+
 export interface CreateProjectInput {
   name: string;
   description?: string;
@@ -121,6 +138,9 @@ export type UpdateProjectInput = Partial<CreateProjectInput>;
 
 export interface ProjectRecord {
   id: string;
+  source: ProjectSource;
+  sourceKey: string | null;
+  sourceSyncedAt: string | null;
   name: string;
   description: string;
   repositoryUrl: string | null;
@@ -221,6 +241,46 @@ export interface MetricSnapshot {
   load1: number | null;
   source: "ssh" | "unavailable";
   note: string | null;
+}
+
+export interface RemoteInventoryProject {
+  key: string;
+  name: string;
+  path: string;
+  manifest: string;
+}
+
+export interface RemoteInventoryService {
+  manager: ServiceManager;
+  name: string;
+  identifier: string;
+  status: string;
+  image: string | null;
+  ports: string | null;
+  projectPath: string | null;
+}
+
+export interface ServerInventory {
+  serverId: string;
+  collectedAt: string;
+  hostname: string | null;
+  os: string | null;
+  kernel: string | null;
+  dockerAvailable: boolean;
+  projects: RemoteInventoryProject[];
+  services: RemoteInventoryService[];
+  listeningPorts: string[];
+  warnings: string[];
+}
+
+export type InventorySyncAction = "created" | "updated" | "unchanged";
+
+export interface InventorySyncResult {
+  serverId: string;
+  collectedAt: string;
+  inventory: ServerInventory;
+  projects: Array<{ action: InventorySyncAction; project: ProjectDetail }>;
+  archived: number;
 }
 
 export interface SessionRecord {

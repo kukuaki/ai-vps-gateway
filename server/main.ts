@@ -6,6 +6,7 @@ import fastifyStatic from "@fastify/static";
 import { z } from "zod";
 import { applyAllVpsSync, defaultAllVpsSourcePaths, loadAllVpsDocument, previewAllVpsSync, type AllVpsSourcePaths } from "./all-vps.js";
 import { GatewayDatabase } from "./db.js";
+import { discoveredProjectsForInventory } from "./inventory.js";
 import { GatewayOperationError, GatewayOperations, type GatewayOperationOptions } from "./operations.js";
 import { SshExecutor } from "./ssh.js";
 import { probeServer } from "./probes.js";
@@ -14,7 +15,11 @@ import type {
   CreateServerInput,
   HealthCheckConfig,
   HealthCheckKind,
+  InventorySyncResult,
   ProjectServiceInput,
+  ServerInventory,
+  ServerRecord,
+  SshNetworkMode,
   UpdateProjectInput,
   UpdateServerInput
 } from "./types.js";
@@ -61,21 +66,36 @@ const healthCheckSchema = z
     }
   });
 
-const createServerSchema = z.object({
+const serverSchemaFields = {
   name: z.string().trim().min(1).max(80),
   address: hostSchema,
-  sshPort: z.number().int().min(1).max(65535).default(22),
-  sshUser: sshUserSchema.default("root"),
-  credentialRef: credentialRefSchema.nullable().optional(),
-  role: z.string().trim().max(100).default(""),
-  environment: z.string().trim().min(1).max(40).default("production"),
-  accessUrl: z.string().url().nullable().optional(),
-  tags: z.array(z.string().trim().min(1).max(32)).max(20).default([]),
-  maintenance: z.boolean().default(false),
-  healthChecks: z.array(healthCheckSchema).max(20).default([])
+  sshPort: z.number().int().min(1).max(65535),
+  sshUser: sshUserSchema,
+  networkMode: z.enum(["system", "direct"]),
+  credentialRef: credentialRefSchema.nullable(),
+  role: z.string().trim().max(100),
+  environment: z.string().trim().min(1).max(40),
+  accessUrl: z.string().url().nullable(),
+  tags: z.array(z.string().trim().min(1).max(32)).max(20),
+  maintenance: z.boolean(),
+  healthChecks: z.array(healthCheckSchema).max(20)
+};
+
+const createServerSchema = z.object({
+  ...serverSchemaFields,
+  sshPort: serverSchemaFields.sshPort.default(22),
+  sshUser: serverSchemaFields.sshUser.default("root"),
+  networkMode: serverSchemaFields.networkMode.default("system"),
+  credentialRef: serverSchemaFields.credentialRef.optional(),
+  role: serverSchemaFields.role.default(""),
+  environment: serverSchemaFields.environment.default("production"),
+  accessUrl: serverSchemaFields.accessUrl.optional(),
+  tags: serverSchemaFields.tags.default([]),
+  maintenance: serverSchemaFields.maintenance.default(false),
+  healthChecks: serverSchemaFields.healthChecks.default([])
 });
 
-const updateServerSchema = createServerSchema.partial();
+const updateServerSchema = z.object(serverSchemaFields).partial();
 const projectRunbookSchema = z.object({
   overview: z.string().trim().max(12_000).default(""),
   deployment: z.string().trim().max(12_000).default(""),
@@ -144,6 +164,13 @@ const commandSchema = z.object({
 });
 const sessionCloseSchema = z.object({ reason: z.string().trim().min(1).max(120).optional() });
 const metricsSchema = z.object({ sessionId: z.string().uuid().optional() });
+const metricHistoryQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(240).default(48),
+  hours: z.coerce.number().int().min(1).max(24 * 30).default(24 * 7)
+});
+const alertQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).default(30)
+});
 export const DEFAULT_ROOT_ACCESS_DURATION_MS = 8 * 60 * 60_000;
 const emergencyRootSchema = z.object({
   durationMs: z.number().int().min(5 * 60_000).max(DEFAULT_ROOT_ACCESS_DURATION_MS).default(DEFAULT_ROOT_ACCESS_DURATION_MS)
@@ -188,6 +215,7 @@ function normalizeHealthChecks(
 function normalizeCreateInput(input: z.infer<typeof createServerSchema>): CreateServerInput {
   return {
     ...input,
+    networkMode: input.networkMode as SshNetworkMode,
     healthChecks: normalizeHealthChecks(input.healthChecks)
   };
 }
@@ -230,6 +258,13 @@ function normalizeUpdateProjectInput(input: z.infer<typeof updateProjectSchema>)
   };
 }
 
+function syncInventoryProjects(database: GatewayDatabase, server: ServerRecord, inventory: ServerInventory): InventorySyncResult {
+  const inputs = discoveredProjectsForInventory(server, inventory);
+  const projects = inputs.map((input) => database.syncDiscoveredProject(input));
+  const archived = inventory.warnings.length ? 0 : database.archiveMissingDiscoveredProjects(server.id, inputs.map((input) => input.sourceKey));
+  return { serverId: server.id, collectedAt: inventory.collectedAt, inventory, projects, archived };
+}
+
 class ProbeScheduler {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
@@ -259,6 +294,36 @@ class ProbeScheduler {
   }
 }
 
+class MetricsScheduler {
+  private timer: NodeJS.Timeout | null = null;
+  private running = false;
+
+  constructor(private readonly database: GatewayDatabase, private readonly operations: GatewayOperations, private readonly intervalMs: number) {}
+
+  start(): void {
+    this.timer = setInterval(() => void this.run(), this.intervalMs);
+    this.timer.unref();
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+  }
+
+  private async run(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+    try {
+      for (const server of this.database.listServers()) {
+        if (server.maintenance || !server.credentialRef) continue;
+        if (server.sshUser === "root" && !this.database.emergencyRootActive(server.id)) continue;
+        await this.operations.collectMetrics(server.id, undefined, "scheduler:metrics");
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 export interface GatewayOptions {
   allVpsSourcePaths?: AllVpsSourcePaths;
   operationOptions?: GatewayOperationOptions;
@@ -268,13 +333,16 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
   const app = Fastify({ logger: process.env.NODE_ENV === "production" });
   const intervalMs = Math.min(Math.max(Number(process.env.ALLVPS_PROBE_INTERVAL_MS ?? 30_000), 10_000), 300_000);
   const scheduler = new ProbeScheduler(database, intervalMs);
+  const metricsIntervalMs = Math.min(Math.max(Number(process.env.ALLVPS_METRICS_INTERVAL_MS ?? 5 * 60_000), 60_000), 60 * 60_000);
   const operations = new GatewayOperations(database, options.operationOptions ?? {
     idleTimeoutMs: Number(process.env.ALLVPS_SESSION_IDLE_MS ?? 30 * 60 * 1_000),
     maxSessionDurationMs: Number(process.env.ALLVPS_SESSION_MAX_MS ?? 8 * 60 * 60 * 1_000),
     sweepIntervalMs: Number(process.env.ALLVPS_SESSION_SWEEP_MS ?? 30_000),
     commandRetentionMs: Number(process.env.ALLVPS_COMMAND_RETENTION_MS ?? 90 * 24 * 60 * 60 * 1_000),
+    metricRetentionMs: Number(process.env.ALLVPS_METRIC_RETENTION_MS ?? 30 * 24 * 60 * 60 * 1_000),
     sshExecutor: new SshExecutor()
   });
+  const metricsScheduler = new MetricsScheduler(database, operations, metricsIntervalMs);
   const allVpsSourcePaths = options.allVpsSourcePaths ?? defaultAllVpsSourcePaths();
 
   await app.register(cors, {
@@ -296,8 +364,20 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     return {
       server,
       events: database.recentHealthEvents(server.id),
-      metric: database.latestMetric(server.id)
+      metric: database.latestMetric(server.id),
+      inventory: database.latestInventory(server.id)
     };
+  });
+
+  app.get("/api/servers/:id/metrics/history", (request, reply) => {
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return validationError(reply, params.error.issues);
+    const query = metricHistoryQuerySchema.safeParse(request.query ?? {});
+    if (!query.success) return validationError(reply, query.error.issues);
+    const server = database.getServer(params.data.id);
+    if (!server) return reply.code(404).send({ error: "NotFound", message: "未找到 VPS" });
+    const since = new Date(Date.now() - query.data.hours * 60 * 60_000).toISOString();
+    return { metrics: database.metricHistory(server.id, query.data.limit, since) };
   });
 
   app.post("/api/servers", (request, reply) => {
@@ -345,6 +425,91 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     } catch (error) {
       return operationError(reply, error);
     }
+  });
+
+  app.post("/api/metrics/all", async () => {
+    const results: Array<{ serverId: string; metric?: ReturnType<GatewayDatabase["latestMetric"]>; error?: string }> = [];
+    for (const server of database.listServersBySource("all-vps").filter((item) => !item.archivedAt)) {
+      try {
+        results.push({ serverId: server.id, metric: await operations.collectMetrics(server.id, undefined, "webui:all-metrics") });
+      } catch (error) {
+        results.push({ serverId: server.id, error: error instanceof Error ? error.message : "性能采集失败" });
+      }
+    }
+    const success = results.filter((result) => !result.error).length;
+    const unavailable = results.filter((result) => result.metric?.source === "unavailable").length;
+    database.audit("metrics.all.collected", "source", "all-vps", `批量采集 VPS 性能：成功 ${success}，失败 ${results.length - success}`, results.length === success ? "info" : "warning", {
+      total: results.length,
+      success,
+      unavailable,
+      failed: results.length - success
+    });
+    return { results, summary: { total: results.length, success, unavailable, failed: results.length - success } };
+  });
+
+  app.post("/api/servers/:id/inventory", async (request, reply) => {
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return validationError(reply, params.error.issues);
+    const body = metricsSchema.safeParse(request.body ?? {});
+    if (!body.success) return validationError(reply, body.error.issues);
+    try {
+      const inventory = await operations.collectInventory(params.data.id, body.data.sessionId, "webui:inventory");
+      return { inventory };
+    } catch (error) {
+      return operationError(reply, error);
+    }
+  });
+
+  app.post("/api/servers/:id/inventory/sync-projects", async (request, reply) => {
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return validationError(reply, params.error.issues);
+    const body = metricsSchema.safeParse(request.body ?? {});
+    if (!body.success) return validationError(reply, body.error.issues);
+    const server = database.getServer(params.data.id);
+    if (!server) return reply.code(404).send({ error: "NotFound", message: "未找到 VPS" });
+    try {
+      const inventory = await operations.collectInventory(server.id, body.data.sessionId, "webui:project-sync");
+      const result = syncInventoryProjects(database, server, inventory);
+      database.audit("inventory.projects.synced", "server", server.id, `同步项目档案：${server.name}`, "info", {
+        projects: result.projects.length,
+        created: result.projects.filter((item) => item.action === "created").length,
+        updated: result.projects.filter((item) => item.action === "updated").length,
+        archived: result.archived
+      });
+      return result;
+    } catch (error) {
+      return operationError(reply, error);
+    }
+  });
+
+  app.post("/api/inventory/all-vps/sync-projects", async (_request, reply) => {
+    const results: Array<InventorySyncResult | { serverId: string; error: string }> = [];
+    for (const server of database.listServersBySource("all-vps").filter((item) => !item.archivedAt)) {
+      try {
+        const inventory = await operations.collectInventory(server.id, undefined, "webui:all-vps-project-sync");
+        results.push(syncInventoryProjects(database, server, inventory));
+      } catch (error) {
+        results.push({ serverId: server.id, error: error instanceof Error ? error.message : "项目盘点失败" });
+      }
+    }
+    const synced = results.filter((result): result is InventorySyncResult => "inventory" in result);
+    const failed = results.length - synced.length;
+    database.audit("inventory.all-vps.projects.synced", "source", "all-vps", `批量同步 VPS 项目：成功 ${synced.length}，失败 ${failed}`, failed ? "warning" : "info", {
+      total: results.length,
+      success: synced.length,
+      failed
+    });
+    return {
+      results,
+      summary: {
+        total: results.length,
+        success: synced.length,
+        failed,
+        created: synced.reduce((count, result) => count + result.projects.filter((project) => project.action === "created").length, 0),
+        updated: synced.reduce((count, result) => count + result.projects.filter((project) => project.action === "updated").length, 0),
+        archived: synced.reduce((count, result) => count + result.archived, 0)
+      }
+    };
   });
 
   app.post("/api/servers/:id/emergency-root", (request, reply) => {
@@ -520,6 +685,12 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
 
   app.get("/api/audit", () => ({ events: database.recentAudit() }));
 
+  app.get("/api/alerts", (request, reply) => {
+    const query = alertQuerySchema.safeParse(request.query ?? {});
+    if (!query.success) return validationError(reply, query.error.issues);
+    return { alerts: database.recentMetricAlerts(query.data.limit) };
+  });
+
   const distDirectory = resolve(process.cwd(), "dist");
   if (existsSync(distDirectory)) {
     await app.register(fastifyStatic, { root: distDirectory, prefix: "/" });
@@ -532,9 +703,11 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
   app.addHook("onReady", () => {
     scheduler.start();
     operations.start();
+    metricsScheduler.start();
   });
   app.addHook("onClose", () => {
     scheduler.stop();
+    metricsScheduler.stop();
     operations.stop();
     database.close();
   });
