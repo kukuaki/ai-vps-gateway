@@ -66,6 +66,23 @@ export interface ServerRecord {
   healthChecks: HealthCheck[];
 }
 
+export interface ServerProjectReference {
+  id: string;
+  name: string;
+  source: ProjectSource;
+  archivedAt: string | null;
+}
+
+export type SshBindingStatus = "pending" | "bound";
+
+export interface SshBindingInfo {
+  status: SshBindingStatus;
+  canTest: boolean;
+  publicKey: string | null;
+  installCommand: string | null;
+  message: string;
+}
+
 export interface CreateServerInput {
   name: string;
   address: string;

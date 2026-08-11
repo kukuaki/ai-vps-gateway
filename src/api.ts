@@ -12,6 +12,7 @@ import type {
   ServerDetail,
   ServerPayload,
   ServerRecord,
+  SshBindingResponse,
   SessionDetail,
   SessionRecord,
   ServerProjectSyncResult
@@ -47,9 +48,12 @@ export const api = {
   updateServer: (id: string, payload: ServerPayload) =>
     request<{ server: ServerRecord }>(`/api/servers/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   probeServer: (id: string) => request<{ server: ServerRecord }>(`/api/servers/${id}/probe`, { method: "POST" }),
+  prepareSshBinding: (id: string) => request<SshBindingResponse>(`/api/servers/${id}/ssh/bootstrap`, { method: "POST" }),
+  testSshBinding: (id: string) => request<SshBindingResponse>(`/api/servers/${id}/ssh/test`, { method: "POST" }),
   grantEmergencyRoot: (id: string, durationMs = 8 * 60 * 60_000) => request<{ server: ServerRecord }>(`/api/servers/${id}/emergency-root`, { method: "POST", body: JSON.stringify({ durationMs }) }),
   revokeEmergencyRoot: (id: string) => request<{ server: ServerRecord }>(`/api/servers/${id}/emergency-root/revoke`, { method: "POST" }),
   archiveServer: (id: string) => request<{ archived: boolean }>(`/api/servers/${id}/archive`, { method: "POST" }),
+  deleteServer: (id: string) => request<{ deleted: true; serverId: string; credentialRemoved: boolean }>(`/api/servers/${id}/delete`, { method: "POST", body: JSON.stringify({ confirmed: true }) }),
   sessions: () => request<{ sessions: SessionRecord[] }>("/api/sessions"),
   openSession: (serverId: string, requester = "webui") => request<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: JSON.stringify({ serverId, requester }) }),
   session: (id: string) => request<{ session: SessionDetail }>(`/api/sessions/${id}`),
@@ -65,6 +69,11 @@ export const api = {
   updateProject: (id: string, payload: ProjectPayload) =>
     request<{ project: ProjectDetail }>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   archiveProject: (id: string) => request<{ archived: boolean }>(`/api/projects/${id}/archive`, { method: "POST" }),
+  deleteProject: (id: string, cleanupSummary: string) =>
+    request<{ deleted: true; projectId: string; projectName: string }>(`/api/projects/${id}/delete`, {
+      method: "POST",
+      body: JSON.stringify({ cleanupConfirmed: true, cleanupSummary })
+    }),
   previewAllVpsSync: () => request<AllVpsSyncPreview>("/api/sync/all-vps/preview"),
   syncAllVps: (sourceDigest: string) =>
     request<AllVpsSyncPreview>("/api/sync/all-vps", { method: "POST", body: JSON.stringify({ sourceDigest }) })

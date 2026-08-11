@@ -15,6 +15,10 @@ function boundedTimeout(value: number | undefined): number {
   return Math.min(Math.max(value ?? DEFAULT_TIMEOUT_MS, 250), 10_000);
 }
 
+function retryableHttpFailure(result: ProbeResult): boolean {
+  return !result.ok && result.statusCode === undefined;
+}
+
 export function probeTcp(host: string, port: number, timeoutMs = DEFAULT_TIMEOUT_MS, localAddress?: string): Promise<ProbeResult> {
   const startedAt = Date.now();
   const timeout = boundedTimeout(timeoutMs);
@@ -130,7 +134,17 @@ export async function probeHttp(check: HealthCheck, localAddress?: string, conne
     return { kind: "http", name: check.name, ok: false, latencyMs: elapsed(startedAt), detail: "URL 必须以 http:// 或 https:// 开头" };
   }
   try {
-    return await requestHttp(new URL(url), expected, boundedTimeout(check.config.timeoutMs), localAddress, connectAddress, startedAt, 0).then((result) => ({ ...result, name: check.name }));
+    const parsedUrl = new URL(url);
+    const timeout = boundedTimeout(check.config.timeoutMs);
+    const first = await requestHttp(parsedUrl, expected, timeout, localAddress, connectAddress, startedAt, 0);
+    if (!retryableHttpFailure(first)) return { ...first, name: check.name };
+    const retry = await requestHttp(parsedUrl, expected, timeout, localAddress, connectAddress, Date.now(), 0);
+    return {
+      ...retry,
+      name: check.name,
+      latencyMs: elapsed(startedAt),
+      detail: retry.ok ? `网络失败后重试成功：${retry.detail}` : `连续两次网络失败：${retry.detail}`
+    };
   } catch (error) {
     return { kind: "http", name: check.name, ok: false, latencyMs: elapsed(startedAt), detail: error instanceof Error ? error.message : "HTTP 请求失败" };
   }

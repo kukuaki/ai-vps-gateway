@@ -1,6 +1,6 @@
 import { GatewayDatabase } from "./db.js";
 import { assessCommand, displayCommand, redactText } from "./command-policy.js";
-import { CredentialError } from "./credentials.js";
+import { buildSshBootstrapCommand, CredentialError } from "./credentials.js";
 import { INVENTORY_COMMAND, parseInventoryOutput } from "./inventory.js";
 import { SshExecutor } from "./ssh.js";
 import type {
@@ -10,6 +10,7 @@ import type {
   MetricSnapshot,
   ServerRecord,
   ServerInventory,
+  SshBindingInfo,
   SessionDetail,
   SessionRecord
 } from "./types.js";
@@ -42,6 +43,11 @@ export interface GatewayOperationOptions {
   commandRetentionMs?: number;
   metricRetentionMs?: number;
   sshExecutor?: SshExecutor;
+}
+
+export interface SshBindingResult {
+  server: ServerRecord;
+  binding: SshBindingInfo;
 }
 
 function boundedDuration(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
@@ -79,6 +85,14 @@ function unavailableMetric(serverId: string, note: string): MetricSnapshot {
     source: "unavailable",
     note
   };
+}
+
+function sshBindingErrorDetail(result: { timedOut: boolean; stderr: string; error: string | null; exitCode: number | null }): string {
+  if (result.timedOut) return "连接超时";
+  const detail = redactText(result.stderr || result.error || "SSH 未接受该公钥", 1_000).value
+    .replace(/\s+/g, " ")
+    .trim();
+  return detail || (result.exitCode === null ? "无法启动本机 SSH 客户端" : `SSH 返回退出码 ${result.exitCode}`);
 }
 
 function normalizeMetric(metric: MetricSnapshot): MetricSnapshot {
@@ -137,6 +151,7 @@ export class GatewayOperations {
   readonly commandRetentionMs: number;
   readonly metricRetentionMs: number;
   private readonly sweepIntervalMs: number;
+  private readonly bindingTasks = new Map<string, Promise<SshBindingResult>>();
   private timer: NodeJS.Timeout | null = null;
 
   constructor(database: GatewayDatabase, options: GatewayOperationOptions = {}) {
@@ -178,6 +193,171 @@ export class GatewayOperations {
 
   getSession(sessionId: string): SessionDetail | null {
     return this.database.getSession(sessionId, this.idleTimeoutMs);
+  }
+
+  async prepareSshBinding(serverId: string): Promise<SshBindingResult> {
+    const server = this.database.getServer(serverId);
+    if (!server) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
+
+    if (server.credentialRef) {
+      try {
+        this.ssh.credentialStore.pathFor(server);
+      } catch (error) {
+        const message = error instanceof CredentialError ? error.message : "网关凭据不可用";
+        throw new GatewayOperationError(409, "CredentialUnavailable", message);
+      }
+      return {
+        server,
+        binding: {
+          status: "bound",
+          canTest: true,
+          publicKey: null,
+          installCommand: null,
+          message: "这台 VPS 已关联网关凭据。可执行一次无交互测试，以确认连接并登记主机指纹。"
+        }
+      };
+    }
+
+    try {
+      const generated = await this.ssh.credentialStore.ensureGeneratedCredential(server.id);
+      this.database.audit("server.ssh.binding.prepared", "server", server.id, `已准备 SSH 绑定：${server.name}`, "info", {
+        serverId: server.id,
+        sshUser: server.sshUser
+      });
+      return {
+        server,
+        binding: {
+          status: "pending",
+          canTest: true,
+          publicKey: generated.publicKey,
+          installCommand: buildSshBootstrapCommand(generated.publicKey),
+          message: "网关已在本机生成专属密钥。请在 VPS 的线上终端安装公钥后测试连接。"
+        }
+      };
+    } catch (error) {
+      const message = error instanceof CredentialError ? error.message : "无法准备 SSH 绑定";
+      throw new GatewayOperationError(422, "SshBindingPreparationFailed", message);
+    }
+  }
+
+  async testSshBinding(serverId: string): Promise<SshBindingResult> {
+    const pending = this.bindingTasks.get(serverId);
+    if (pending) return pending;
+
+    const task = this.performSshBindingTest(serverId).finally(() => this.bindingTasks.delete(serverId));
+    this.bindingTasks.set(serverId, task);
+    return task;
+  }
+
+  private async performSshBindingTest(serverId: string): Promise<SshBindingResult> {
+    const server = this.database.getServer(serverId);
+    if (!server) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
+    const conflictingSession = this.database.listActiveSessions(this.idleTimeoutMs).find((session) => session.serverId === server.id);
+    if (conflictingSession) {
+      throw new GatewayOperationError(409, "ServerBusy", "服务器当前已有 AI 会话，不能同时执行 SSH 绑定测试", {
+        sessionId: conflictingSession.id,
+        status: conflictingSession.status
+      });
+    }
+
+    let candidate = server;
+    let binding: SshBindingInfo;
+    if (server.credentialRef) {
+      try {
+        this.ssh.credentialStore.pathFor(server);
+      } catch (error) {
+        const message = error instanceof CredentialError ? error.message : "网关凭据不可用";
+        throw new GatewayOperationError(409, "CredentialUnavailable", message);
+      }
+      binding = {
+        status: "bound",
+        canTest: true,
+        publicKey: null,
+        installCommand: null,
+        message: "已验证网关凭据与 SSH 连接。"
+      };
+    } else {
+      const prepared = await this.prepareSshBinding(server.id);
+      if (!prepared.binding.publicKey || !prepared.server) {
+        throw new GatewayOperationError(409, "CredentialUnavailable", "未找到待绑定的网关凭据");
+      }
+      const generated = await this.ssh.credentialStore.ensureGeneratedCredential(server.id);
+      candidate = { ...server, credentialRef: generated.credentialRef };
+      binding = prepared.binding;
+    }
+
+    let result;
+    try {
+      result = await this.ssh.execute(candidate, "true", 20_000, { hostKeyPolicy: "accept-new" });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "本机 SSH 客户端不可用";
+      this.database.audit("server.ssh.binding.failed", "server", server.id, `SSH 绑定测试失败：${server.name}`, "warning", {
+        serverId: server.id,
+        detail: redactText(detail, 1_000).value
+      });
+      throw new GatewayOperationError(422, "SshBindingFailed", `SSH 绑定失败：${detail}`);
+    }
+
+    if (result.timedOut || result.exitCode !== 0) {
+      const detail = sshBindingErrorDetail(result);
+      this.database.audit("server.ssh.binding.failed", "server", server.id, `SSH 绑定测试失败：${server.name}`, "warning", {
+        serverId: server.id,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        detail
+      });
+      throw new GatewayOperationError(422, "SshBindingFailed", `SSH 绑定失败：${detail}。请确认公钥已写入 ${server.sshUser} 用户的 authorized_keys。`);
+    }
+
+    const updated = server.credentialRef
+      ? this.database.getServer(server.id)
+      : this.database.updateServer(server.id, { credentialRef: candidate.credentialRef });
+    if (!updated) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
+    this.database.audit("server.ssh.bound", "server", server.id, `SSH 绑定成功：${server.name}`, "info", {
+      serverId: server.id,
+      sshUser: updated.sshUser,
+      hostKeyPolicy: "accept-new"
+    });
+    return {
+      server: updated,
+      binding: {
+        ...binding,
+        status: "bound",
+        canTest: false,
+        publicKey: null,
+        installCommand: null,
+        message: "SSH 已验证。后续网关连接会严格校验本次登记的主机指纹。"
+      }
+    };
+  }
+
+  deleteServerRecord(serverId: string): { deleted: true; serverId: string; credentialRemoved: boolean } {
+    const server = this.database.getServer(serverId, true);
+    if (!server) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
+    const linkedProjects = this.database.projectsForServer(serverId, true);
+    if (linkedProjects.length) {
+      throw new GatewayOperationError(409, "ServerHasProjects", "VPS“" + server.name + "”仍关联 " + linkedProjects.length + " 个项目，先完成项目清理后再删除", {
+        projects: linkedProjects
+      });
+    }
+    const openSessions = this.database.listActiveSessions(this.idleTimeoutMs).filter((session) => session.serverId === serverId);
+    if (openSessions.length) {
+      throw new GatewayOperationError(409, "ServerHasSessions", "VPS“" + server.name + "”仍有活动或排队会话，请先释放会话", {
+        sessions: openSessions.map((session) => session.id)
+      });
+    }
+    const result = this.database.deleteServer(serverId);
+    if (!result.deleted) throw new GatewayOperationError(409, "ServerDeleteConflict", "VPS 删除条件在操作期间发生变化");
+    let credentialRemoved = false;
+    try {
+      credentialRemoved = this.ssh.credentialStore.removeGeneratedCredential(server);
+    } catch {
+      this.database.audit("server.credential.cleanup_failed", "server", serverId, "VPS 删除后网关自动凭据清理失败：" + server.name, "critical");
+    }
+    this.database.audit("server.deleted", "server", serverId, "删除 VPS：" + server.name, "critical", {
+      credentialRemoved
+    });
+    return { deleted: true, serverId, credentialRemoved };
   }
 
   openSession(serverId: string, requester?: string): SessionRecord {

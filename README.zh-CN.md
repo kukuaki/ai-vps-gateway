@@ -6,7 +6,7 @@
 
 ## 当前范围
 
-- 手动新增、编辑、维护和归档 VPS，数据保存在本机 SQLite。
+- 手动新增、编辑、维护和归档 VPS，新增资产带有首次 SSH 绑定向导，数据保存在本机 SQLite。
 - 从现有 `all-vps` 文档同步 VPS 清单与已知域名健康检查。
 - 不依赖 Ping 的测活：TCP、SSH Banner、HTTP(S) 服务检查。
 - 健康历史、当前性能快照、30 天性能历史、SVG 趋势图、阈值告警、审计事件、维护状态和归档状态。
@@ -15,7 +15,7 @@
 - 默认只绑定 `127.0.0.1` 的 Vue WebUI。
 - 供 Codex、Claude Code 使用的本机 stdio MCP 网关：读取可直接执行，远程命令必须先申请独占会话。
 
-网关刻意不读取、上传或暴露私钥内容。Node 只解析逻辑凭据引用，由本机 `ssh` 进程从网关凭据目录读取密钥文件；显式导入命令仅执行本机文件复制，不解析密钥字节。
+网关刻意不读取、上传或暴露私钥内容。新增 VPS 时，网关可在私有凭据目录中生成专属 Ed25519 密钥对；Node 只返回公钥，并由本机 `ssh` 进程使用私钥。已有密钥的显式导入仍只执行本机文件复制，不解析密钥字节。
 
 ## 安全边界
 
@@ -27,6 +27,7 @@
 - 命令和输出在保存前脱敏，默认保存 90 天后清理；资产、项目摘要和审计事件继续保存在本机 SQLite。
 - ICMP Ping 失败不会直接判定 VPS 离线；SSH/TCP 和项目健康检查才是主判断依据。
 - SSH 执行不会继承 HTTP/SOCKS 代理环境变量，并明确关闭 `ProxyCommand` 与 `ProxyJump`；all-vps 资产默认使用 `networkMode=direct`，让 SSH 绑定物理网卡，避免 macOS TUN 模式把云服务器的登录出口变成代理地址。公开 HTTP(S) 健康检查默认使用系统路由，用来验证域名公开路径，不会被误当成源站 SSH 流量。
+- 首次绑定测试只会在本机没有该主机指纹时使用一次 `StrictHostKeyChecking=accept-new` 进行登记；后续所有操作都严格校验指纹，已登记主机的指纹变化绝不会被自动覆盖。
 - `all-vps` 同步不会读取私钥，并会保留本机凭据引用、维护状态和可选 root 救援状态。
 
 ## 环境要求
@@ -34,6 +35,7 @@
 - macOS 或 Linux
 - Node.js 24+
 - npm 11+
+- OpenSSH 客户端工具：`ssh` 与 `ssh-keygen`
 
 ## 本地开发
 
@@ -60,6 +62,18 @@ npm run build
 
 只要网关进程持续运行，性能调度器默认每 5 分钟采集一次符合条件的 VPS（包括已登记的 root VPS），并保留 30 天。概览和 VPS 详情页会显示历史趋势；CPU 达到 90%、内存达到 90%、磁盘达到 85%，或性能从可用变为不可用时，会写入去重后的 warning 审计告警。
 
+## macOS 桌面客户端
+
+桌面客户端把本机 API、MCP 适配器、WebUI 和 macOS 菜单栏常驻组合在一个应用中。双击应用后，网关自动绑定 `127.0.0.1:4318` 并打开可视化界面；关闭或最小化窗口时只隐藏窗口，本地网关和 MCP 继续运行。点击菜单栏图标会弹出菜单，可打开仪表盘、MCP 设置、数据目录或退出。退出应用时，只关闭由它自己启动的本地网关，不会停止远程 VPS 服务。运行数据和凭据仍保存在用户目录，不会打包进应用。
+
+在 Apple Silicon Mac 上构建 arm64 安装包：
+
+```bash
+npm run package:desktop
+```
+
+产物位于 `release/`，包括 `.dmg` 和 `.zip`。开发时可用 `npm run run:desktop` 启动已构建的桌面窗口。应用图标、WebUI 品牌标识和菜单栏模板分别打包，确保三个位置使用正确的图形。应用右上角的 MCP 设置入口可以一键登记 Codex 或 Claude Code；标准 MCP 连接仍由对应 AI 客户端按 stdio 启动，客户端只通过本机网关 API 工作。
+
 SSH 执行默认使用以下本机目录：
 
 ```text
@@ -67,7 +81,9 @@ SSH 执行默认使用以下本机目录：
 ~/.ssh/known_hosts
 ```
 
-请由用户自己把密钥文件放入凭据目录，并在 VPS 的 `credentialRef` 中填写文件名，不填写路径。网关只检查文件元数据和权限，不读取密钥内容。可以设置 `ALLVPS_CREDENTIAL_DIR` 或 `ALLVPS_KNOWN_HOSTS_FILE` 使用其他位置。主机指纹必须已经登记在 `known_hosts` 中，网关不会静默接受新指纹。
+新增 VPS 后，WebUI 会自动生成专属 Ed25519 密钥对，只展示公钥和一条可重复执行的安装命令。用户只需通过云厂商网页终端、已有 SSH 登录或其他已授权入口，以所选 SSH 用户执行一次该命令，再回到 WebUI 点击“测试绑定”。无交互 SSH 测试成功后，网关才会写入逻辑凭据引用并解锁会话、项目盘点和性能采集。私钥始终以 `0600` 保存在网关目录中，不会显示在界面、写入仓库或交给 AI 客户端。
+
+首次成功测试会把新的主机指纹登记到本机 `known_hosts`；后续操作要求精确匹配，服务器重装或主机密钥变更时会拒绝连接并要求人工核对。已有导入密钥仍通过原有的逻辑 `credentialRef` 工作。可以设置 `ALLVPS_CREDENTIAL_DIR` 或 `ALLVPS_KNOWN_HOSTS_FILE` 使用其他位置。
 
 ## 同步现有 all-vps 清单
 
@@ -91,7 +107,7 @@ npm run sync:all-vps
 
 ## 同步远程项目
 
-项目盘点通过只读 SSH 执行，只收集有限元数据：主机名、系统、Docker 容器名称/镜像/状态/端口映射/挂载、非基础 systemd 服务、PM2/Node 进程名称、PID、工作目录和监听端口、项目清单路径和依赖名称，以及筛选后的 Web 路由指令（`server_name`、`listen`、`proxy_pass`、`root`）。不会读取环境变量、日志、私钥、Token 或完整配置文件。Nginx 路由会依据静态目录、反代上游端口、进程工作目录和服务管理器证据归并到项目；域名只记录为项目 Web 入口，不会单独生成“域名项目”。结果保存在本机，并按稳定的 `remote-inventory` 标识创建或更新项目档案，自动填写技术栈、项目级 Web 入口（发现到时）、详细服务清单、项目概览、部署步骤、验证步骤、排错手册和变更边界。消失的自动项目只会归档不会删除；如果盘点有警告，也不会执行缺失项目归档。
+项目盘点通过只读 SSH 执行，只收集有限元数据：主机名、系统、Docker 容器名称/镜像/状态/端口映射/挂载、非基础 systemd 服务、PM2/Node 进程名称、PID、工作目录和监听端口、项目清单路径和依赖名称，以及筛选后的已启用 Nginx 路由指令（`server_name`、`listen`、`proxy_pass`、`root`）。不会读取环境变量、日志、私钥、Token 或完整配置文件。Nginx 路由会依据静态目录、反代上游端口、进程工作目录和服务管理器证据归并到项目；域名只记录为项目 Web 入口，不会单独生成“域名项目”。服务器级健康检查域名只用于 VPS 测活，不会凭空附加到项目；证书续期用的 `acme`、`letsencrypt`、`certbot` 路由也不会被当成站点入口。对于公开映射 `2095/tcp` 的 S-UI Docker 服务，网关会记录默认管理入口 `http://<server>:2095/app/`；订阅端口不会被当作普通 Web 入口。结果保存在本机，并按稳定的 `remote-inventory` 标识创建或更新项目档案，自动填写技术栈、项目级 Web 入口（发现到时）、详细服务清单、项目概览、部署步骤、验证步骤、排错手册和变更边界。消失的自动项目只会归档不会删除；完整盘点成功后，历史自动项目会解除与当前 VPS 的实时关联但保留归档记录；如果盘点有警告，也不会执行缺失项目归档。
 
 ```bash
 npm run sync:vps-projects
@@ -129,11 +145,32 @@ npm run import:all-vps-credentials
 }
 ```
 
-当前提供：`list_servers`、`get_server`、`get_dashboard`、`list_projects`、`get_project`、`list_sessions`、`open_session`、`get_session`、`run_command`、`close_session`、`collect_metrics`、`collect_all_metrics`、`get_metric_history`、`list_metric_alerts`、`sync_server_projects`、`sync_all_vps_projects`。
+使用 macOS 桌面客户端时，不需要让 AI 客户端启动 Node/npm。先打开桌面上的 `AI VPS Gateway.app`，然后在右上角 MCP 设置中一键登记；等价的 stdio 配置是：
 
-正常执行流程是：先 `open_session`，如果返回排队就等待，再通过 `run_command` 执行，必要时使用 `collect_metrics` 获取当前性能，完成后 `close_session`。root VPS 通过正常凭据和主机指纹检查后即可走同一流程；WebUI 的 root 救援提示只是额外的高危告警和审计信号。API 和 MCP 适配器默认只绑定 `127.0.0.1`，AI 不会拿到私钥或任意本机 SSH 路径。
+```json
+{
+  "mcpServers": {
+    "ai-vps-gateway": {
+      "command": "/Users/kukuaki/Desktop/AI VPS Gateway.app/Contents/MacOS/AI VPS Gateway",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
 
-项目 Runbook 分为项目概览、部署步骤、验证步骤、排错手册和变更边界五部分。当前保存在本机 SQLite，供后续 AI 会话通过只读 MCP 查询；不要在 Runbook 中写入密码、Token、私钥或完整环境变量。
+桌面窗口隐藏后，本机 API 和 MCP 仍然可用。需要停止服务时，从菜单栏菜单选择“退出”；此时只会停止由该桌面应用启动的本地网关。
+
+当前提供：`list_servers`、`get_server`、`get_dashboard`、`prepare_ssh_binding`、`test_ssh_binding`、`list_projects`、`get_project`、`create_project`、`update_project`、`delete_project`、`delete_server`、`list_sessions`、`open_session`、`get_session`、`run_command`、`close_session`、`collect_metrics`、`collect_all_metrics`、`get_metric_history`、`list_metric_alerts`、`sync_server_projects`、`sync_all_vps_projects`。
+
+对于尚未绑定的新 VPS，Agent 可先调用 `prepare_ssh_binding`，让用户在云厂商控制台或已有登录中执行返回的公钥安装命令，再调用 `test_ssh_binding`。正常执行流程是：先 `open_session`，如果返回排队就等待，再通过 `run_command` 执行，必要时使用 `collect_metrics` 获取当前性能，完成后 `close_session`。root VPS 通过正常凭据和主机指纹检查后即可走同一流程；WebUI 的 root 救援提示只是额外的高危告警和审计信号。API 和 MCP 适配器默认只绑定 `127.0.0.1`，AI 不会拿到私钥或任意本机 SSH 路径。
+
+项目 Runbook 分为项目概览、部署步骤、验证步骤、排错手册和变更边界五部分。当前保存在本机 SQLite，后续 AI 会话可读取，也可通过明确的本机 MCP 项目工具新建或更新；不要在 Runbook 中写入密码、Token、私钥或完整环境变量。WebUI 还可一键复制带项目或 VPS 上下文的运维、新增项目提示词，且不会暴露凭据。
+
+### 删除流程
+
+WebUI 的“复制删除项目提示词”会经过两次确认。提示词要求 Agent 先通过网关盘点、清理并验证远程服务，再调用 `delete_project` 删除本机项目档案；共享 Nginx、`sing-box`、VLESS/Reality、SS 和 Cloudflare 节点必须逐项保护。`delete_project` 本身只删除本机项目记录，不会替代远程清理。
+
+“复制删除 VPS 提示词”同样需要两次确认。`delete_server` 只允许在没有项目关联、没有活动或排队会话时删除本机 VPS 记录；它不会删除远程主机。完整盘点会把过期的自动归档记录解除实时关联但保留历史；仍存在的归档项目或手动项目关联依然会阻止删除。
 
 在当前这个仓库中，先启动本机 API/WebUI，再分别注册 MCP：
 

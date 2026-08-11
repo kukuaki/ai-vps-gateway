@@ -29,6 +29,7 @@ import type {
   ProjectWebEndpoint,
   ProbeResult,
   ServerInventory,
+  ServerProjectReference,
   ServerRecord,
   ServerSource,
   ServerStatus,
@@ -155,6 +156,13 @@ interface RawProject {
   server_count: number;
   service_count: number;
   critical_service_count: number;
+}
+
+interface RawServerProjectReference {
+  id: string;
+  name: string;
+  source: string;
+  archived_at: string | null;
 }
 
 interface RawProjectServer {
@@ -1204,6 +1212,19 @@ export class GatewayDatabase {
     return rows.map(toProject);
   }
 
+  projectsForServer(serverId: string, includeArchived = true): ServerProjectReference[] {
+    const query = includeArchived
+      ? "SELECT DISTINCT p.id, p.name, p.source, p.archived_at FROM projects p LEFT JOIN project_servers ps ON ps.project_id = p.id LEFT JOIN project_services psvc ON psvc.project_id = p.id WHERE (ps.server_id = ? OR psvc.server_id = ?) ORDER BY p.name COLLATE NOCASE"
+      : "SELECT DISTINCT p.id, p.name, p.source, p.archived_at FROM projects p LEFT JOIN project_servers ps ON ps.project_id = p.id LEFT JOIN project_services psvc ON psvc.project_id = p.id WHERE (ps.server_id = ? OR psvc.server_id = ?) AND p.archived_at IS NULL ORDER BY p.name COLLATE NOCASE";
+    const rows = this.db.prepare(query).all(serverId, serverId) as unknown as RawServerProjectReference[];
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      source: row.source === "remote-inventory" ? "remote-inventory" : "manual",
+      archivedAt: row.archived_at
+    }));
+  }
+
   getProject(projectId: string, includeArchived = false): ProjectDetail | null {
     const raw = this.rawProject(projectId, includeArchived);
     if (!raw) return null;
@@ -1334,7 +1355,8 @@ export class GatewayDatabase {
     const sameServices = JSON.stringify(comparableProjectServices(existing.services)) === JSON.stringify(comparableProjectServices(services));
     const preservedManualEndpoints = existing.webEndpoints.filter((endpoint) => endpoint.source === "manual");
     const nextWebEndpoints = normalizedWebEndpoints([...preservedManualEndpoints, ...discoveredWebEndpoints]);
-    const nextTechnologyStack = normalizedStringList([...existing.technologyStack, ...discoveredTechnologyStack]);
+    // 远程盘点以本次实际发现的运行栈为准，不能把已停止项目的旧标签永久带入新的快照。
+    const nextTechnologyStack = discoveredTechnologyStack;
     const unchanged = existing.name === input.name &&
       existing.description === input.description &&
       existing.repositoryPath === (input.repositoryPath ?? null) &&
@@ -1363,11 +1385,30 @@ export class GatewayDatabase {
       .prepare("SELECT id, source_key FROM projects WHERE source = 'remote-inventory' AND archived_at IS NULL AND source_key LIKE ?")
       .all(`${serverId}:%`) as unknown as Array<{ id: string; source_key: string }>;
     const stale = rows.filter((row) => !activeKeys.has(row.source_key));
-    if (!stale.length) return 0;
+    const archived = this.db
+      .prepare(`
+        SELECT DISTINCT p.id
+        FROM projects p
+        LEFT JOIN project_servers ps ON ps.project_id = p.id
+        LEFT JOIN project_services psvc ON psvc.project_id = p.id
+        WHERE p.source = 'remote-inventory' AND p.archived_at IS NOT NULL
+          AND (ps.server_id = ? OR psvc.server_id = ?)
+      `)
+      .all(serverId, serverId) as unknown as Array<{ id: string }>;
+    if (!stale.length && !archived.length) return 0;
     const timestamp = now();
     return this.transaction(() => {
       const update = this.db.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?");
       for (const row of stale) update.run(timestamp, timestamp, row.id);
+      // Archived inventory is historical documentation, not a live server association.
+      // Detach it after a successful inventory pass so stale discoveries cannot block VPS lifecycle actions.
+      const clearServices = this.db.prepare("DELETE FROM project_services WHERE project_id = ?");
+      const clearServers = this.db.prepare("DELETE FROM project_servers WHERE project_id = ?");
+      const archivedIds = new Set([...archived.map((row) => row.id), ...stale.map((row) => row.id)]);
+      for (const projectId of archivedIds) {
+        clearServices.run(projectId);
+        clearServers.run(projectId);
+      }
       return stale.length;
     });
   }
@@ -1380,12 +1421,37 @@ export class GatewayDatabase {
     return result.changes > 0;
   }
 
+  deleteProject(projectId: string): { id: string; name: string } | null {
+    const existing = this.getProject(projectId, true);
+    if (!existing) return null;
+    return this.transaction(() => {
+      // Explicitly clear association rows so databases created before the cascade migration remain deletable.
+      this.db.prepare("DELETE FROM project_services WHERE project_id = ?").run(projectId);
+      this.db.prepare("DELETE FROM project_servers WHERE project_id = ?").run(projectId);
+      const result = this.db.prepare("DELETE FROM projects WHERE id = ?").run(projectId);
+      return result.changes ? { id: existing.id, name: existing.name } : null;
+    });
+  }
+
   archiveServer(serverId: string): boolean {
     const timestamp = now();
     const result = this.db
       .prepare("UPDATE servers SET archived_at = ?, status = 'archived', updated_at = ? WHERE id = ? AND archived_at IS NULL")
       .run(timestamp, timestamp, serverId);
     return result.changes > 0;
+  }
+
+  deleteServer(serverId: string): {
+    deleted: boolean;
+    server: ServerRecord | null;
+    linkedProjects: ServerProjectReference[];
+  } {
+    const existing = this.getServer(serverId, true);
+    if (!existing) return { deleted: false, server: null, linkedProjects: [] };
+    const linkedProjects = this.projectsForServer(serverId, true);
+    if (linkedProjects.length) return { deleted: false, server: existing, linkedProjects };
+    const deleted = this.transaction(() => this.db.prepare("DELETE FROM servers WHERE id = ?").run(serverId).changes > 0);
+    return { deleted, server: deleted ? existing : this.getServer(serverId, true), linkedProjects: [] };
   }
 
   clearServerAccessUrl(serverId: string): void {

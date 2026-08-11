@@ -24,6 +24,10 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return apiRequest<T>(path, { method: "POST", body: JSON.stringify(body) });
 }
 
+async function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  return apiRequest<T>(path, { method: "PATCH", body: JSON.stringify(body) });
+}
+
 function jsonResult(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
 }
@@ -37,6 +41,37 @@ function errorResult(error: unknown) {
 
 const server = new McpServer({ name: "ai-vps-gateway", version: "0.1.0" });
 
+const projectRunbookInput = z.object({
+  overview: z.string().trim().max(12_000).default(""),
+  deployment: z.string().trim().max(12_000).default(""),
+  verification: z.string().trim().max(12_000).default(""),
+  troubleshooting: z.string().trim().max(12_000).default(""),
+  guardrails: z.string().trim().max(12_000).default("")
+});
+const projectServerInput = z.object({
+  serverId: z.string().uuid().describe("AI VPS Gateway 中的 VPS UUID"),
+  role: z.string().trim().max(80).default("")
+});
+const projectServiceInput = z.object({
+  serverId: z.string().uuid().describe("必须是本项目已关联的 VPS UUID"),
+  name: z.string().trim().min(1).max(100),
+  manager: z.enum(["docker", "systemd", "process", "external"]),
+  identifier: z.string().trim().min(1).max(160),
+  port: z.number().int().min(1).max(65_535).nullable().optional(),
+  portMappings: z.array(z.string().trim().min(1).max(160)).max(40).default([]),
+  accessUrl: z.string().url().nullable().optional(),
+  critical: z.boolean().default(false),
+  notes: z.string().trim().max(4_000).default("")
+});
+const projectEndpointInput = z.object({
+  label: z.string().trim().min(1).max(120),
+  url: z.string().url(),
+  port: z.number().int().min(1).max(65_535).nullable().optional(),
+  serviceName: z.string().trim().max(100).nullable().optional(),
+  notes: z.string().trim().max(1_000).default(""),
+  source: z.enum(["manual", "remote-inventory"]).optional()
+});
+
 server.registerTool(
   "list_servers",
   {
@@ -47,6 +82,42 @@ server.registerTool(
   async () => {
     try {
       return jsonResult(await apiGet("/api/servers"));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+server.registerTool(
+  "prepare_ssh_binding",
+  {
+    title: "Prepare SSH VPS binding",
+    description: "为一台尚未绑定的 VPS 在本机网关生成专属 Ed25519 凭据，并返回可由用户粘贴到云厂商网页终端或现有 SSH 会话的一条公钥安装命令。只返回公钥，不会返回或读取私钥。用户完成线上安装后，再调用 test_ssh_binding。",
+    inputSchema: {
+      serverId: z.string().uuid().describe("AI VPS Gateway 中的 VPS UUID")
+    }
+  },
+  async ({ serverId }) => {
+    try {
+      return jsonResult(await apiPost(`/api/servers/${serverId}/ssh/bootstrap`, {}));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+server.registerTool(
+  "test_ssh_binding",
+  {
+    title: "Test and finish SSH VPS binding",
+    description: "通过本机网关以 BatchMode 测试 SSH 公钥登录。首次成功连接时仅接受并保存该主机的新 SSH 指纹；之后的运维连接保持严格指纹校验。成功后自动关联网关凭据，AI 仍不会接触私钥。",
+    inputSchema: {
+      serverId: z.string().uuid().describe("已完成公钥安装的 VPS UUID")
+    }
+  },
+  async ({ serverId }) => {
+    try {
+      return jsonResult(await apiPost(`/api/servers/${serverId}/ssh/test`, {}));
     } catch (error) {
       return errorResult(error);
     }
@@ -272,15 +343,35 @@ server.registerTool(
 );
 
 server.registerTool(
-  "get_dashboard",
+ "get_dashboard",
+ {
+   title: "Get VPS dashboard",
+   description: "读取本机网关的 VPS 健康汇总和资产状态。不会执行远程命令。",
+   annotations: { readOnlyHint: true }
+ },
+ async () => {
+   try {
+     return jsonResult(await apiGet("/api/dashboard"));
+   } catch (error) {
+     return errorResult(error);
+   }
+ }
+);
+
+server.registerTool(
+  "delete_server",
   {
-    title: "Get VPS dashboard",
-    description: "读取本机网关的 VPS 健康汇总和资产状态。不会执行远程命令。",
-    annotations: { readOnlyHint: true }
+    title: "Delete VPS record",
+    description: "删除本机 VPS 记录及其本地历史数据。网关会强制检查该 VPS 没有任何活动或已归档项目关联、没有活动/排队会话；不会删除远程服务器内容。必须明确传 confirmed=true。all-vps 文档仍包含该资产时，后续同步可能重新导入。",
+    inputSchema: {
+      serverId: z.string().uuid().describe("AI VPS Gateway 中的 VPS UUID"),
+      confirmed: z.literal(true).describe("必须明确确认删除")
+    },
+    annotations: { destructiveHint: true }
   },
-  async () => {
+  async ({ serverId, confirmed }) => {
     try {
-      return jsonResult(await apiGet("/api/dashboard"));
+      return jsonResult(await apiPost(`/api/servers/${serverId}/delete`, { confirmed }));
     } catch (error) {
       return errorResult(error);
     }
@@ -320,4 +411,85 @@ server.registerTool(
   }
 );
 
-await server.connect(new StdioServerTransport());
+server.registerTool(
+  "create_project",
+  {
+    title: "Create local project runbook",
+    description: "在本机 AI VPS Gateway 新建项目档案和五段 Runbook；不会执行远程命令或写入 VPS。Web 入口只能是项目站点地址，不能填写 VPS SSH 连接地址。",
+    inputSchema: {
+      name: z.string().trim().min(1).max(100),
+      description: z.string().trim().max(2_000).default(""),
+      repositoryUrl: z.string().url().nullable().optional(),
+      repositoryPath: z.string().trim().min(1).max(320).nullable().optional(),
+      technologyStack: z.array(z.string().trim().min(1).max(80)).max(100).default([]),
+      webEndpoints: z.array(projectEndpointInput).max(100).default([]),
+      runbook: projectRunbookInput.default({ overview: "", deployment: "", verification: "", troubleshooting: "", guardrails: "" }),
+      servers: z.array(projectServerInput).max(30).default([]),
+      services: z.array(projectServiceInput).max(100).default([])
+    }
+  },
+  async (input) => {
+    try {
+      return jsonResult(await apiPost("/api/projects", input));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+server.registerTool(
+ "update_project",
+ {
+   title: "Update local project runbook",
+   description: "更新本机项目档案或 Runbook；不会执行远程命令或写入 VPS。提交 servers、services 或 webEndpoints 时会替换该完整列表，操作前应先 get_project 保留已有记录。",
+   inputSchema: {
+     projectId: z.string().uuid().describe("AI VPS Gateway 中的项目 UUID"),
+     name: z.string().trim().min(1).max(100).optional(),
+     description: z.string().trim().max(2_000).optional(),
+     repositoryUrl: z.string().url().nullable().optional(),
+     repositoryPath: z.string().trim().min(1).max(320).nullable().optional(),
+     technologyStack: z.array(z.string().trim().min(1).max(80)).max(100).optional(),
+     webEndpoints: z.array(projectEndpointInput).max(100).optional(),
+     runbook: projectRunbookInput.optional(),
+     servers: z.array(projectServerInput).max(30).optional(),
+     services: z.array(projectServiceInput).max(100).optional()
+   }
+ },
+ async ({ projectId, ...input }) => {
+   try {
+     return jsonResult(await apiPatch(`/api/projects/${projectId}`, input));
+   } catch (error) {
+     return errorResult(error);
+   }
+ }
+);
+
+server.registerTool(
+  "delete_project",
+  {
+    title: "Delete project record after remote cleanup",
+    description: "删除本机项目记录、Runbook、项目服务和 VPS 关联。此工具不会清理远程服务器；Agent 必须先通过网关会话完成并验证远程清理，再明确传 cleanupConfirmed=true 和中文 cleanupSummary。",
+    inputSchema: {
+      projectId: z.string().uuid().describe("AI VPS Gateway 中的项目 UUID"),
+      cleanupConfirmed: z.literal(true).describe("必须确认远程服务已清理并验证"),
+      cleanupSummary: z.string().trim().min(20).max(4_000).describe("远程清理的服务、配置、验证结果和残留风险；不要写入密码、Token 或私钥")
+    },
+    annotations: { destructiveHint: true }
+  },
+  async ({ projectId, cleanupConfirmed, cleanupSummary }) => {
+    try {
+      return jsonResult(await apiPost(`/api/projects/${projectId}/delete`, { cleanupConfirmed, cleanupSummary }));
+    } catch (error) {
+      return errorResult(error);
+    }
+  }
+);
+
+export async function startMcpServer(): Promise<void> {
+  await server.connect(new StdioServerTransport());
+}
+
+void startMcpServer().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});

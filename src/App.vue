@@ -1,18 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import {
   Activity,
   Archive,
   ArrowUpRight,
   BellRing,
+  Cable,
   ChevronLeft,
   CircleAlert,
   CircleCheckBig,
   Clock3,
+  Copy,
   FolderKanban,
   FolderSync,
   Gauge,
   Globe2,
+  KeyRound,
   LayoutDashboard,
   Network,
   Plus,
@@ -21,6 +24,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Terminal,
+  Trash2,
   X
 } from "@lucide/vue";
 import { api } from "./api";
@@ -38,11 +42,13 @@ import type {
   ServerPayload,
   ServerRecord,
   ServerStatus,
+  SshBindingResponse,
   SshNetworkMode,
   ServiceManager,
   SessionDetail,
   SessionRecord
 } from "./types";
+import type { DesktopGatewayStatus } from "./desktop";
 
 type ViewName = "overview" | "servers" | "projects" | "audit";
 
@@ -78,7 +84,17 @@ const isSessionAction = ref(false);
 const isCollectingMetrics = ref(false);
 const isAllMetricsCollecting = ref(false);
 const isRootAction = ref(false);
+const isDeletingServer = ref(false);
+const copyingPrompt = ref<string | null>(null);
+const showSshBinding = ref(false);
+const sshBinding = ref<SshBindingResponse | null>(null);
+const isPreparingSshBinding = ref(false);
+const isTestingSshBinding = ref(false);
 const projectQuery = ref("");
+const desktopStatus = ref<DesktopGatewayStatus | null>(null);
+const showMcpSetup = ref(false);
+const isInstallingMcp = ref<"codex" | "claude" | null>(null);
+let removeDesktopMcpListener: (() => void) | undefined;
 const ROOT_ACCESS_DURATION_MS = 8 * 60 * 60_000;
 
 interface FormState {
@@ -140,7 +156,7 @@ const form = reactive<FormState>({
   name: "",
   address: "",
   sshPort: 22,
-  sshUser: "ubuntu",
+  sshUser: "root",
   networkMode: "direct",
   credentialRef: "",
   role: "",
@@ -204,6 +220,7 @@ const visibleProjects = computed(() => {
 });
 
 const selectedServer = computed(() => selected.value?.server ?? null);
+const selectedServerProjects = computed(() => selected.value?.linkedProjects ?? []);
 const selectedServerSession = computed(() => {
   const serverId = selectedServer.value?.id;
   return serverId ? sessions.value.find((session) => session.serverId === serverId) ?? null : null;
@@ -289,12 +306,295 @@ function emptyRunbook(): ProjectRunbook {
   return { overview: "", deployment: "", verification: "", troubleshooting: "", guardrails: "" };
 }
 
+async function writeClipboard(text: string): Promise<void> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Localhost can deny the asynchronous Clipboard API; fall back to a temporary textarea.
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("浏览器拒绝访问剪贴板");
+}
+
+function projectServicesSummary(project: ProjectDetail): string {
+  if (!project.services.length) return "- 暂无已登记服务";
+  return project.services
+    .map((service) => {
+      const port = service.port === null ? "" : `，端口 ${service.port}`;
+      return `- ${service.serverName}：${service.name}（${managerLabels[service.manager]} / ${service.identifier}${port}${service.critical ? "，关键" : ""}）`;
+    })
+    .join("\n");
+}
+
+function projectEndpointsSummary(project: ProjectDetail): string {
+  if (!project.webEndpoints.length) return "- 暂无已确认项目 Web 入口";
+  return project.webEndpoints
+    .map((endpoint) => `- ${endpoint.label}：${endpoint.url}${endpoint.serviceName ? `（${endpoint.serviceName}）` : ""}`)
+    .join("\n");
+}
+
+function projectServersSummary(project: ProjectDetail): string {
+  if (!project.servers.length) return "- 暂无关联 VPS";
+  return project.servers
+    .map((server) => `- ${server.serverName}${server.role ? `（${server.role}）` : ""}，serverId: ${server.serverId}`)
+    .join("\n");
+}
+
+function buildProjectManagementPrompt(project: ProjectDetail): string {
+  return `你现在负责运维项目「${project.name}」（projectId: ${project.id}）。
+
+强制约束：
+- 所有服务器访问只能使用 ai-vps-gateway MCP；严禁直接 SSH、读取私钥、使用本机 SSH 配置或绕过会话租约。
+- 先调用 get_project 读取最新 Runbook 和完整档案；不要依赖下面的快照替代实时数据。
+- 修改前先说明计划、影响范围和回滚方式；高危操作必须在执行前明确提示。
+- 不要把 VPS 的 SSH 地址或连接地址登记为项目 Web 入口；只有已验证的项目公开地址才能写入 webEndpoints。
+
+执行顺序：
+1. 调用 get_project({ projectId: "${project.id}" })，确认 Runbook、关联 VPS、服务、端口和变更边界。
+2. 对需要操作的每台 VPS，先调用 get_server；再按顺序 open_session -> run_command -> close_session。若会话排队，等待而不是绕过网关。
+3. 完成部署、修复或配置变更后，调用 update_project 写回最新的服务、端口、项目 Web 入口和五段 Runbook。更新 servers、services 或 webEndpoints 时必须提交完整列表，避免覆盖已有记录。
+4. 最后给出变更、验证结果、残留风险和回滚方法的中文摘要。
+
+当前档案快照：
+技术栈：${project.technologyStack.length ? project.technologyStack.join("、") : "尚未确认"}
+关联 VPS：
+${projectServersSummary(project)}
+项目 Web 入口：
+${projectEndpointsSummary(project)}
+已登记服务：
+${projectServicesSummary(project)}`;
+}
+
+function buildServerManagementPrompt(server: ServerRecord): string {
+  return `请通过 ai-vps-gateway 管理 VPS「${server.name}」（serverId: ${server.id}）。
+
+强制约束：
+- 所有远程操作必须走 ai-vps-gateway MCP，严禁直接 SSH、读取私钥或绕过会话锁。
+- 此 VPS 的网络路径由网关处理；不要自行修改代理、TUN、SSH 配置或凭据。
+- 遇到高危操作，先说明影响和回滚路径；网关的硬性阻断规则必须保留。
+
+执行顺序：
+1. 调用 get_server({ serverId: "${server.id}" })，读取当前健康、性能、已盘点服务和错误。
+2. 需要当前性能时调用 collect_metrics。需要刷新项目盘点时，在活动会话中调用 sync_server_projects。
+3. 需要远程命令时按 open_session -> run_command -> close_session 顺序执行；会话排队时等待。
+4. 涉及项目的服务、端口、域名入口或排错方案变化时，使用 get_project / update_project 更新对应项目档案与 Runbook。项目 Web 入口只登记站点地址，不登记 VPS 连接地址。
+5. 最后以中文汇报检查结论、执行命令、验证结果、风险和下一步。
+
+当前资产快照：
+- 环境：${server.environment}
+- 用途：${server.role || "未分类"}
+- 状态：${statusOf(server.status).label}
+- SSH 用户：${server.sshUser}
+- 网络路径：${server.networkMode === "direct" ? "直连物理网卡（绕过 TUN）" : "系统路由"}`;
+}
+
+function buildNewProjectPrompt(server: ServerRecord): string {
+  return `我要在 VPS「${server.name}」（serverId: ${server.id}）新增一个项目。请使用 ai-vps-gateway MCP 完成从确认需求到建立运维档案的完整流程。
+
+先向我确认：项目名称、代码来源或仓库、运行时/技术栈、是否需要公开 Web 入口、域名、预期端口、数据存储和不可中断的现有服务。信息缺失时不要自行注册域名、开放端口、覆盖 Nginx 配置或停止现有服务。
+
+确认后按以下规则执行：
+1. 先调用 get_server({ serverId: "${server.id}" })，检查 VPS 当前状态和已有项目；必要时调用 list_projects 排除重复项目。
+2. 所有远程操作必须经过 open_session -> run_command -> close_session；禁止直接 SSH、读取私钥或绕过网关。
+3. 部署优先采用有 Git 仓库的 Docker Compose；确有必要使用 systemd 或 PM2 时，必须记录 unit / 进程名、工作目录、端口、日志位置、依赖、启停与回滚命令。
+4. 部署并验证后，在活动会话中调用 sync_server_projects。若已经发现对应项目，调用 get_project 后用 update_project 补齐资料；若没有发现，再调用 create_project 建立本机项目档案。
+5. 项目档案必须完整填写技术栈、关联 VPS、服务与端口、已验证的项目级 Web 入口，以及 overview、deployment、verification、troubleshooting、guardrails 五段 Runbook。Web 入口只能填项目站点地址，不能填 VPS SSH 地址。
+6. 最后输出部署结果、验证命令、排错入口、风险、回滚方案和后续维护建议。`;
+}
+
+function confirmTwice(title: string, warning: string): boolean {
+  if (!window.confirm("第 1 次确认\n\n" + title + "\n\n" + warning)) return false;
+  return window.confirm("第 2 次确认\n\n" + title + "\n\n这一步不可自动恢复，继续吗？");
+}
+
+function linkedProjectsForServer(server: ServerRecord): string {
+  const links = selected.value?.server.id === server.id ? selected.value.linkedProjects : [];
+  if (!links.length) return "- 当前没有已知项目关联";
+  return links.map((project) => "- " + project.name + "（projectId: " + project.id + (project.archivedAt ? "，已归档" : "") + "）").join("\n");
+}
+
+function buildServerDeletionPrompt(server: ServerRecord): string {
+  return [
+    "请通过 ai-vps-gateway MCP 删除 VPS「" + server.name + "」（serverId: " + server.id + "）的本机资产记录。",
+    "",
+    "这不是远程服务器清理任务。删除前必须确认该 VPS 没有任何活动或已归档项目关联；如果仍有关联，立即停止，不要绕过网关。",
+    "所有检查和删除都只能通过 ai-vps-gateway MCP，禁止直接 SSH、读取私钥或访问本机 SSH 配置。",
+    "",
+    "执行顺序：",
+    "1. 调用 get_server({ serverId: \"" + server.id + "\" })，读取 linkedProjects、状态和当前会话。",
+    "2. 如果 linkedProjects 非空，停止并列出项目，不调用 delete_server。",
+    "3. 确认没有 active 或 queued 会话后，调用 delete_server({ serverId: \"" + server.id + "\", confirmed: true })。",
+    "4. 汇报本机记录删除结果；不要因为 all-vps 文档仍有该资产而重复删除或直接修改文档。",
+    "",
+    "当前已知项目关联：",
+    linkedProjectsForServer(server),
+    "资产来源：" + server.source + "；地址仅用于网关内部识别：" + server.address + ":" + server.sshPort
+  ].join("\n");
+}
+
+function buildProjectDeletionPrompt(project: ProjectDetail): string {
+  const services = project.services.length
+    ? project.services.map((service) => "- " + service.serverName + "：" + service.name + "（" + service.manager + " / " + service.identifier + (service.port ? " / :" + service.port : "") + (service.portMappings.length ? " / " + service.portMappings.join("；") : "") + "）").join("\n")
+    : "- 暂无已登记服务，仍需在远程盘点后确认没有残留";
+  return [
+    "你现在负责清理并删除项目「" + project.name + "」（projectId: " + project.id + "）。",
+    "",
+    "目标：先通过网关连接所有关联 VPS，清理该项目在远程主机上的服务、进程、容器、Nginx 路由和项目代码；完成验证后，最后调用 delete_project 删除本机项目记录。",
+    "",
+    "强制约束：",
+    "- 所有远程访问只能使用 ai-vps-gateway MCP：get_project、get_server、sync_server_projects、open_session、run_command、close_session。严禁直接 SSH、读取私钥、使用本机 SSH 配置或绕过会话锁。",
+    "- 只能清理本项目明确归属的资源。Nginx 可能被多个项目或 Cloudflare 节点共享，必须按 server_name、location、proxy_pass 和上游逐块确认，不能停止或删除全局 Nginx。",
+    "- 绝对不能触碰 sing-box.service、VLESS/Reality、Shadowsocks/SS、Cloudflare 节点入口、其配置、密钥、订阅或监听端口；如果发现项目与这些资源边界不清，停止并报告，不调用 delete_project。",
+    "- 禁止宽泛的 rm、通配符清理、格式化磁盘、删除根目录或未经核实的数据目录。高危操作先说明影响、备份和回滚。",
+    "",
+    "执行顺序：",
+    "1. 先调用 get_project({ projectId: \"" + project.id + "\" })，核对最新 Runbook、关联 VPS、服务、端口和 Web 入口；下面快照不能替代实时结果。",
+    "2. 对每台关联 VPS 调用 get_server，再调用 sync_server_projects 刷新现状；识别服务实际管理方式、unit/PM2/Docker 标识、工作目录、配置路径和共享依赖。",
+    "3. 每台 VPS 依次 open_session -> run_command -> close_session。先读后改：记录目标资源和保护资源，停止/禁用/移除的范围必须逐项列出。",
+    "4. 清理后再次 sync_server_projects 或执行等价只读验证：目标服务、进程、容器、项目入口不再运行；保护的 VLESS/SS/Cloudflare 节点仍健康。验证不完整就不要删除本机记录。",
+    "5. 关闭所有会话后调用 delete_project({ projectId: \"" + project.id + "\", cleanupConfirmed: true, cleanupSummary: \"...\" })。cleanupSummary 要写清停止/删除了什么、如何验证、保留了什么和残留风险；不要写密码、Token、私钥或业务数据。",
+    "6. 如果任何一步失败、发现共享服务、无法确认数据归属或保护节点受影响，停止，不调用 delete_project，先汇报。",
+    "",
+    "当前档案快照：",
+    "技术栈：" + (project.technologyStack.length ? project.technologyStack.join("、") : "尚未确认"),
+    "关联 VPS：",
+    projectServersSummary(project),
+    "项目 Web 入口：",
+    projectEndpointsSummary(project),
+    "已登记服务：",
+    services
+  ].join("\n");
+}
+
+async function copyPrompt(key: string, label: string, prompt: string): Promise<void> {
+  copyingPrompt.value = key;
+  errorMessage.value = null;
+  try {
+    await writeClipboard(prompt);
+    notify(`${label}已复制，可直接粘贴给支持 ai-vps-gateway 的 Agent`);
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "复制提示词失败";
+  } finally {
+    copyingPrompt.value = null;
+  }
+}
+
+async function copyProjectManagementPrompt(project: ProjectDetail): Promise<void> {
+  await copyPrompt("project-management", "项目运维提示词", buildProjectManagementPrompt(project));
+}
+
+async function copyServerManagementPrompt(server: ServerRecord): Promise<void> {
+  await copyPrompt("server-management", "VPS 管理提示词", buildServerManagementPrompt(server));
+}
+
+async function copyNewProjectPrompt(server: ServerRecord): Promise<void> {
+  await copyPrompt("new-project", "新增项目提示词", buildNewProjectPrompt(server));
+}
+
+async function copyServerDeletionPrompt(server: ServerRecord): Promise<void> {
+  if (!confirmTwice("复制 VPS 删除提示词", "提示词会指导 Agent 检查项目关联后删除本机记录，不会删除远程服务器。")) return;
+  await copyPrompt("server-delete", "删除 VPS 提示词", buildServerDeletionPrompt(server));
+}
+
+async function copyProjectDeletionPrompt(project: ProjectDetail): Promise<void> {
+  if (!confirmTwice("复制项目删除提示词", "Agent 会被要求先清理并验证远程服务，最后才删除本机项目记录。")) return;
+  await copyPrompt("project-delete", "删除项目提示词", buildProjectDeletionPrompt(project));
+}
+
+async function copySshBindingValue(kind: "command" | "public-key"): Promise<void> {
+  const value = kind === "command" ? sshBinding.value?.binding.installCommand : sshBinding.value?.binding.publicKey;
+  if (!value) return;
+  await copyPrompt(`ssh-binding-${kind}`, kind === "command" ? "首次绑定命令" : "SSH 公钥", value);
+}
+
+async function loadDesktopStatus(): Promise<void> {
+  if (!window.aiVpsDesktop) return;
+  try {
+    desktopStatus.value = await window.aiVpsDesktop.getStatus();
+  } catch {
+    desktopStatus.value = null;
+  }
+}
+
+async function openMcpSetup(): Promise<void> {
+  await loadDesktopStatus();
+  showMcpSetup.value = Boolean(desktopStatus.value);
+}
+
+async function copyMcpCommand(client: "codex" | "claude"): Promise<void> {
+  const status = desktopStatus.value;
+  if (!status) return;
+  try {
+    await writeClipboard(client === "codex" ? status.codexCommand : status.claudeCommand);
+    notify(`${client === "codex" ? "Codex" : "Claude Code"} MCP 命令已复制`);
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "复制 MCP 命令失败";
+  }
+}
+
+async function installMcp(client: "codex" | "claude"): Promise<void> {
+  if (!window.aiVpsDesktop || isInstallingMcp.value) return;
+  isInstallingMcp.value = client;
+  errorMessage.value = null;
+  try {
+    const result = await window.aiVpsDesktop.installMcp(client);
+    if (!result.ok) throw new Error(result.message);
+    notify(`${client === "codex" ? "Codex" : "Claude Code"} MCP 已配置`);
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "配置 MCP 失败";
+  } finally {
+    isInstallingMcp.value = null;
+  }
+}
+
+async function openSshBinding(server: ServerRecord): Promise<void> {
+  if (isPreparingSshBinding.value) return;
+  isPreparingSshBinding.value = true;
+  errorMessage.value = null;
+  try {
+    sshBinding.value = await api.prepareSshBinding(server.id);
+    showSshBinding.value = true;
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "无法准备 SSH 绑定";
+  } finally {
+    isPreparingSshBinding.value = false;
+  }
+}
+
+async function testSshBinding(): Promise<void> {
+  const serverId = sshBinding.value?.server.id;
+  if (!serverId || isTestingSshBinding.value) return;
+  isTestingSshBinding.value = true;
+  errorMessage.value = null;
+  try {
+    sshBinding.value = await api.testSshBinding(serverId);
+    await refresh(serverId);
+    notify(`${sshBinding.value.server.name} SSH 已绑定，可直接开启 AI 会话`);
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "SSH 绑定测试失败";
+  } finally {
+    isTestingSshBinding.value = false;
+  }
+}
+
 function resetForm(): void {
   Object.assign(form, {
     name: "",
     address: "",
     sshPort: 22,
-    sshUser: "ubuntu",
+    sshUser: "root",
     networkMode: "direct",
     credentialRef: "",
     role: "",
@@ -600,7 +900,7 @@ function serverPayload(): ServerPayload {
     sshPort: Number(form.sshPort),
     sshUser: form.sshUser.trim(),
     networkMode: form.networkMode,
-    credentialRef: form.credentialRef.trim() || null,
+    credentialRef: isEditing.value ? form.credentialRef.trim() || null : null,
     role: form.role.trim(),
     environment: form.environment.trim() || "production",
     accessUrl: null,
@@ -615,10 +915,12 @@ async function saveServer(): Promise<void> {
   errorMessage.value = null;
   try {
     const payload = serverPayload();
+    const isNewServer = editingId.value === null;
     const result = editingId.value ? await api.updateServer(editingId.value, payload) : await api.createServer(payload);
     showEditor.value = false;
-    notify(editingId.value ? "VPS 已更新" : "VPS 已添加");
+    notify(isNewServer ? "VPS 已添加，继续完成 SSH 绑定" : "VPS 已更新");
     await refresh(result.server.id);
+    if (isNewServer) await openSshBinding(result.server);
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : "保存失败";
   } finally {
@@ -649,6 +951,28 @@ async function archive(server: ServerRecord): Promise<void> {
     notify(`${server.name} 已归档`);
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : "归档失败";
+  }
+}
+
+async function deleteServerRecord(server: ServerRecord): Promise<void> {
+  const linkedProjects = selected.value?.server.id === server.id ? selected.value.linkedProjects : [];
+  if (linkedProjects.length) {
+    errorMessage.value = "该 VPS 仍关联项目：" + linkedProjects.map((project) => project.name).join("、") + "。先完成项目清理，网关不会强制删除。";
+    return;
+  }
+  if (!confirmTwice("删除 VPS「" + server.name + "」", "将删除本机资产、健康记录、性能历史、会话记录和自动生成的本机凭据；不会删除远程主机。")) return;
+  isDeletingServer.value = true;
+  errorMessage.value = null;
+  try {
+    await api.deleteServer(server.id);
+    selected.value = null;
+    selectedSession.value = null;
+    await refresh();
+    notify(server.name + " 已从本机网关删除");
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "删除 VPS 失败";
+  } finally {
+    isDeletingServer.value = false;
   }
 }
 
@@ -860,18 +1184,27 @@ async function applyAllVpsSync(): Promise<void> {
   }
 }
 
-onMounted(() => void refresh());
+onMounted(() => {
+  void refresh();
+  void loadDesktopStatus();
+  removeDesktopMcpListener = window.aiVpsDesktop?.onOpenMcpSetup(() => {
+    showMcpSetup.value = true;
+    void loadDesktopStatus();
+  });
+});
+
+onUnmounted(() => {
+  removeDesktopMcpListener?.();
+});
 </script>
 
 <template>
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark"><Network :size="20" /></div>
-        <div>
-          <strong>AI VPS Gateway</strong>
-          <span>Local control plane</span>
-        </div>
+        <img class="brand-wordmark" src="/brand-wordmark.png" alt="AI VPS Gateway" />
+        <div class="brand-mark"><img src="/brand-mark.png" alt="" /></div>
+        <span class="brand-tagline">Local control plane</span>
       </div>
 
       <nav class="nav-list" aria-label="主导航">
@@ -904,6 +1237,7 @@ onMounted(() => void refresh());
           <h1>{{ activeView === 'overview' ? '服务器概览' : activeView === 'servers' ? 'VPS 管理' : activeView === 'audit' ? '审计记录' : '项目管理' }}</h1>
         </div>
         <div class="topbar-actions">
+          <button v-if="desktopStatus" class="icon-button" title="MCP 连接设置" @click="openMcpSetup"><Cable :size="18" /></button>
           <button class="icon-button" title="预览 all-vps 同步" :disabled="isSyncing" @click="openAllVpsSync"><FolderSync :size="18" :class="{ spinning: isSyncing }" /></button>
           <button class="icon-button" title="盘点并同步全部 VPS 项目" :disabled="isAllProjectSyncing" @click="syncAllVpsProjects"><FolderKanban :size="18" :class="{ spinning: isAllProjectSyncing }" /></button>
           <button class="icon-button" title="立即采集全部 VPS 性能" :disabled="isAllMetricsCollecting" @click="collectAllMetrics"><Gauge :size="18" :class="{ spinning: isAllMetricsCollecting }" /></button>
@@ -970,14 +1304,18 @@ onMounted(() => void refresh());
         <template v-if="selectedServer">
           <section class="detail-header">
             <div><div class="server-title"><span :class="['status-dot', statusOf(selectedServer.status).tone]"></span><h2>{{ selectedServer.name }}</h2><span :class="['status-badge', statusOf(selectedServer.status).tone]">{{ statusOf(selectedServer.status).label }}</span></div><p>{{ selectedServer.sshUser }}@{{ selectedServer.address }}:{{ selectedServer.sshPort }} <span v-if="selectedServer.role">· {{ selectedServer.role }}</span></p></div>
-            <div class="detail-actions"><button class="icon-button" title="立即测活" :disabled="isProbing === selectedServer.id" @click="probe(selectedServer)"><RefreshCw :size="18" :class="{ spinning: isProbing === selectedServer.id }" /></button><button class="icon-button" title="盘点并同步项目" :disabled="isProjectSyncing" @click="syncServerProjects(selectedServer)"><FolderSync :size="18" :class="{ spinning: isProjectSyncing }" /></button><button v-if="!selectedServerSession" class="secondary-button" :disabled="isSessionAction" @click="openAiSession(selectedServer)"><ShieldCheck :size="16" /> 开启会话</button><button v-else class="secondary-button" :disabled="isSessionAction" @click="closeAiSession"><X :size="16" /> 释放会话</button><button v-if="selectedServer.sshUser === 'root' && !emergencyRootActive(selectedServer)" class="icon-button root-rescue-button" title="开启 8 小时 root 救援提示（不影响正常会话）" :disabled="isRootAction" @click="enableEmergencyRoot(selectedServer)"><ShieldAlert :size="17" /></button><button v-if="selectedServer.sshUser === 'root' && emergencyRootActive(selectedServer)" class="icon-button root-rescue-button" title="关闭 root 救援提示（不影响现有会话）" :disabled="isRootAction" @click="revokeEmergencyRoot(selectedServer)"><ShieldCheck :size="17" /></button><button class="secondary-button" @click="openEdit(selectedServer)">编辑</button><button class="danger-button" @click="archive(selectedServer)"><Archive :size="16" /> 归档</button></div>
+            <div class="detail-actions"><button class="icon-button" title="立即测活" :disabled="isProbing === selectedServer.id" @click="probe(selectedServer)"><RefreshCw :size="18" :class="{ spinning: isProbing === selectedServer.id }" /></button><button class="icon-button" title="盘点并同步项目" :disabled="isProjectSyncing || !selectedServer.credentialRef" @click="syncServerProjects(selectedServer)"><FolderSync :size="18" :class="{ spinning: isProjectSyncing }" /></button><button class="secondary-button" :disabled="copyingPrompt !== null" @click="copyServerManagementPrompt(selectedServer)"><Copy :size="16" /> {{ copyingPrompt === "server-management" ? "复制中" : "复制管理提示词" }}</button><button class="secondary-button" :disabled="copyingPrompt !== null" @click="copyNewProjectPrompt(selectedServer)"><Copy :size="16" /> {{ copyingPrompt === "new-project" ? "复制中" : "新增项目提示词" }}</button><button v-if="!selectedServer.credentialRef" class="secondary-button" :disabled="isPreparingSshBinding" @click="openSshBinding(selectedServer)"><KeyRound :size="16" /> {{ isPreparingSshBinding ? "准备中" : "绑定 SSH" }}</button><button v-else class="secondary-button" :disabled="isPreparingSshBinding" @click="openSshBinding(selectedServer)"><KeyRound :size="16" /> {{ isPreparingSshBinding ? "准备中" : "测试 SSH" }}</button><button v-if="!selectedServerSession" class="secondary-button" :disabled="isSessionAction" @click="openAiSession(selectedServer)"><ShieldCheck :size="16" /> 开启会话</button><button v-else class="secondary-button" :disabled="isSessionAction" @click="closeAiSession"><X :size="16" /> 释放会话</button><button v-if="selectedServer.sshUser === 'root' && !emergencyRootActive(selectedServer)" class="icon-button root-rescue-button" title="开启 8 小时 root 救援提示（不影响正常会话）" :disabled="isRootAction" @click="enableEmergencyRoot(selectedServer)"><ShieldAlert :size="17" /></button><button v-if="selectedServer.sshUser === 'root' && emergencyRootActive(selectedServer)" class="icon-button root-rescue-button" title="关闭 root 救援提示（不影响现有会话）" :disabled="isRootAction" @click="revokeEmergencyRoot(selectedServer)"><ShieldCheck :size="17" /></button><button class="secondary-button" @click="openEdit(selectedServer)">编辑</button><button class="danger-button" @click="archive(selectedServer)"><Archive :size="16" /> 归档</button></div>
           </section>
+          <div class="deletion-action-strip">
+            <div><strong>删除与清理</strong><span v-if="selectedServerProjects.length">已关联 {{ selectedServerProjects.length }} 个项目，先清理项目后才能删除 VPS。</span><span v-else>当前没有项目关联，可以删除本机 VPS 记录。</span></div>
+            <div class="detail-actions"><button class="secondary-button" :disabled="copyingPrompt !== null" @click="copyServerDeletionPrompt(selectedServer)"><Trash2 :size="16" /> {{ copyingPrompt === "server-delete" ? "复制中" : "复制删除 VPS 提示词" }}</button><button class="danger-button" :disabled="isDeletingServer || selectedServerProjects.length > 0" @click="deleteServerRecord(selectedServer)"><Trash2 :size="16" /> {{ isDeletingServer ? "删除中" : "删除 VPS 记录" }}</button></div>
+          </div>
           <div class="detail-grid">
             <section class="panel health-panel"><div class="panel-heading"><div><h2>健康检查</h2><p>{{ humanTime(selectedServer.lastCheckedAt) }}</p></div><Activity :size="20" /></div><div v-if="selected?.events.length" class="probe-list"><div v-for="result in selected.events[0].results" :key="`${selected.events[0].id}-${result.name}`" class="probe-item"><span :class="['status-dot', result.ok ? 'healthy' : 'offline']"></span><span><strong>{{ result.name }}</strong><small>{{ result.detail }}</small></span><em>{{ result.latencyMs }} ms</em></div></div><div v-else class="empty-inline">尚无测活记录</div></section>
             <section class="panel metrics-panel"><div class="panel-heading"><div><h2>性能趋势</h2><p>{{ selected?.metric ? `${humanTime(selected.metric.collectedAt)} · ${metricHistoryLabel}` : '尚未采集' }}</p></div><div class="panel-heading-actions"><select v-model.number="metricHistoryHours" class="metric-range-select" title="性能历史范围" @change="reloadSelectedMetricHistory"><option :value="24">24 小时</option><option :value="24 * 7">7 天</option><option :value="24 * 30">30 天</option></select><button class="mini-icon" title="采集当前性能" :disabled="isCollectingMetrics" @click="collectMetrics(selectedServer)"><RefreshCw :size="15" :class="{ spinning: isCollectingMetrics }" /></button><Gauge :size="20" /></div></div><div v-if="selected?.metric" class="metric-grid"><div v-for="card in metricCards" :key="card.key" class="metric-card"><span>{{ card.label }}</span><strong>{{ card.current ?? '—' }}<small v-if="card.current !== null">{{ card.unit }}</small></strong><svg class="metric-sparkline" viewBox="0 0 100 32" role="img" :aria-label="`${card.label} 最近趋势`"><path d="M0 28H100" /><polyline v-if="card.path" :points="card.path" :style="{ stroke: card.color }" /></svg></div></div><div v-if="metricAlertLabels(selected?.metric ?? null).length" class="metric-alert"><CircleAlert :size="15" /> {{ metricAlertLabels(selected?.metric ?? null).join('、') }}：请结合 Runbook 检查。</div><div v-if="metricNoteFor(selectedServer)" class="metric-note"><CircleAlert :size="15" /> {{ metricNoteFor(selectedServer) }}</div><div v-else-if="!selected?.metric" class="empty-inline">采集的是当前快照，不安装 Agent，也不会读取当前目录中的私钥。</div></section>
             <section class="panel inventory-summary-panel"><div class="panel-heading"><div><h2>项目盘点</h2><p>{{ selected?.inventory ? humanTime(selected.inventory.collectedAt) : '尚未盘点' }}</p></div><FolderKanban :size="20" /></div><div v-if="selected?.inventory" class="inventory-summary"><div><span>项目清单</span><strong>{{ selected.inventory.projects.length }}</strong></div><div><span>运行服务</span><strong>{{ selected.inventory.services.length }}</strong></div><div><span>监听端口</span><strong>{{ selected.inventory.listeningPorts.length }}</strong></div><p v-if="selected.inventory.warnings.length"><CircleAlert :size="14" /> {{ selected.inventory.warnings[0] }}</p></div><div v-else class="empty-inline">点击上方盘点按钮，读取 Docker、systemd、端口和项目清单并同步到项目档案。</div></section>
             <section class="panel session-panel"><div class="panel-heading"><div><h2>AI 会话租约</h2><p>同一 VPS 同时只允许一个执行会话</p></div><ShieldCheck :size="20" /></div><div v-if="selectedServerSession" class="session-summary"><div class="session-summary-top"><span :class="['status-badge', sessionStatusOf(selectedServerSession.status).tone]">{{ sessionStatusOf(selectedServerSession.status).label }}</span><strong>{{ selectedServerSession.requester }}</strong><small v-if="selectedServerSession.status === 'queued'">排队第 {{ selectedServerSession.queuePosition }} 位</small></div><dl class="property-list"><div><dt>空闲释放</dt><dd>{{ selectedServerSession.idleExpiresAt ? humanTime(selectedServerSession.idleExpiresAt) : '获得租约后开始' }}</dd></div><div><dt>最长租期</dt><dd>{{ humanTime(selectedServerSession.maxExpiresAt) }}</dd></div><div><dt>会话 ID</dt><dd class="mono-value">{{ selectedServerSession.id }}</dd></div></dl><div v-if="selectedSession?.commands.length" class="session-command-list"><div v-for="command in selectedSession.commands.slice(0, 5)" :key="command.id"><span :class="['risk-label', command.risk]">{{ commandRiskLabel(command.risk) }}</span><code>{{ command.command }}</code><small>{{ commandOutcomeLabel(command.outcome) }} · {{ humanTime(command.createdAt) }}</small></div></div></div><div v-else class="empty-inline">当前没有占用或排队中的 AI 会话</div></section>
-            <section class="panel inventory-panel"><div class="panel-heading"><div><h2>连接资料</h2><p>仅保存引用，不保存秘密</p></div><Terminal :size="20" /></div><dl class="property-list"><div><dt>环境</dt><dd>{{ selectedServer.environment }}</dd></div><div><dt>数据来源</dt><dd>{{ selectedServer.source === 'all-vps' ? 'all-vps 文档同步' : '手动登记' }}</dd></div><div><dt>SSH 网络</dt><dd>{{ selectedServer.networkMode === 'direct' ? '直连物理网卡' : '系统路由' }}</dd></div><div><dt>凭据引用</dt><dd>{{ selectedServer.credentialRef ?? '未关联' }}</dd></div><div v-if="selectedServer.sshUser === 'root'"><dt>root 访问</dt><dd :class="emergencyRootActive(selectedServer) ? 'root-grant-active' : 'root-grant-missing'">{{ emergencyRootActive(selectedServer) ? `救援提示有效至 ${humanTime(selectedServer.emergencyRootUntil)}` : '已登记，可直接开启会话' }}</dd></div><div><dt>标签</dt><dd><span v-if="selectedServer.tags.length" class="tag-list"><b v-for="tag in selectedServer.tags" :key="tag">{{ tag }}</b></span><span v-else>无</span></dd></div><div><dt>维护状态</dt><dd>{{ selectedServer.maintenance ? '已开启' : '正常' }}</dd></div></dl></section>
+            <section class="panel inventory-panel"><div class="panel-heading"><div><h2>连接资料</h2><p>私钥仅由本机网关保管</p></div><Terminal :size="20" /></div><dl class="property-list"><div><dt>环境</dt><dd>{{ selectedServer.environment }}</dd></div><div><dt>数据来源</dt><dd>{{ selectedServer.source === 'all-vps' ? 'all-vps 文档同步' : '手动登记' }}</dd></div><div><dt>SSH 网络</dt><dd>{{ selectedServer.networkMode === 'direct' ? '直连物理网卡（绕过 TUN）' : '系统路由' }}</dd></div><div><dt>SSH 绑定</dt><dd :class="selectedServer.credentialRef ? 'root-grant-active' : 'root-grant-missing'">{{ selectedServer.credentialRef ? '凭据已关联，可执行 SSH 测试' : '待首次绑定' }}</dd></div><div v-if="selectedServer.sshUser === 'root'"><dt>root 访问</dt><dd :class="emergencyRootActive(selectedServer) ? 'root-grant-active' : 'root-grant-missing'">{{ emergencyRootActive(selectedServer) ? `救援提示有效至 ${humanTime(selectedServer.emergencyRootUntil)}` : '已登记，可直接开启会话' }}</dd></div><div><dt>标签</dt><dd><span v-if="selectedServer.tags.length" class="tag-list"><b v-for="tag in selectedServer.tags" :key="tag">{{ tag }}</b></span><span v-else>无</span></dd></div><div><dt>维护状态</dt><dd>{{ selectedServer.maintenance ? '已开启' : '正常' }}</dd></div></dl></section>
             <section class="panel history-panel"><div class="panel-heading"><div><h2>健康历史</h2><p>最近 {{ selected?.events.length ?? 0 }} 次</p></div><Clock3 :size="20" /></div><div v-if="selected?.events.length" class="timeline"><div v-for="event in selected.events.slice(0, 8)" :key="event.id"><span :class="['status-dot', statusOf(event.status).tone]"></span><strong>{{ statusOf(event.status).label }}</strong><time>{{ humanTime(event.checkedAt) }}</time><p v-if="event.error">{{ event.error }}</p></div></div><div v-else class="empty-inline">尚无健康历史</div></section>
           </div>
         </template>
@@ -994,8 +1332,12 @@ onMounted(() => void refresh());
         <template v-if="selectedProject">
           <section class="project-detail-header">
             <div><div class="server-title"><FolderKanban :size="20" /><h2>{{ selectedProject.name }}</h2></div><p>{{ selectedProject.description || '暂无项目描述' }}</p><div class="project-links"><a v-if="selectedProject.repositoryUrl" :href="selectedProject.repositoryUrl" target="_blank" rel="noreferrer">代码仓库 <ArrowUpRight :size="14" /></a><span v-if="selectedProject.repositoryPath">{{ selectedProject.repositoryPath }}</span></div></div>
-            <div class="detail-actions"><button class="secondary-button" @click="openEditProject(selectedProject)">编辑档案</button><button class="danger-button" @click="archiveProject(selectedProject)"><Archive :size="16" /> 归档</button></div>
+            <div class="detail-actions"><button class="secondary-button" :disabled="copyingPrompt !== null" @click="copyProjectManagementPrompt(selectedProject)"><Copy :size="16" /> {{ copyingPrompt === "project-management" ? "复制中" : "复制运维提示词" }}</button><button class="secondary-button" @click="openEditProject(selectedProject)">编辑档案</button><button class="danger-button" @click="archiveProject(selectedProject)"><Archive :size="16" /> 归档</button></div>
           </section>
+          <div class="deletion-action-strip">
+            <div><strong>项目删除</strong><span>环境清理必须由 Agent 通过网关完成并验证，确认后再删除本机项目记录。</span></div>
+            <div class="detail-actions"><button class="danger-button" :disabled="copyingPrompt !== null" @click="copyProjectDeletionPrompt(selectedProject)"><Trash2 :size="16" /> {{ copyingPrompt === "project-delete" ? "复制中" : "复制删除项目提示词" }}</button></div>
+          </div>
           <div class="project-detail-grid">
             <section class="panel runbook-panel"><div class="panel-heading"><div><h2>运维 Runbook</h2><p>给后续 AI 会话和人工排错使用</p></div><ShieldCheck :size="20" /></div><div class="runbook-sections"><article v-for="section in runbookSections" :key="section.key"><h3>{{ section.label }}</h3><p v-if="selectedProject.runbook[section.key]" class="runbook-text">{{ selectedProject.runbook[section.key] }}</p><p v-else class="empty-inline">尚未填写</p></article></div></section>
             <section class="panel project-tech-panel"><div class="panel-heading"><div><h2>技术栈与 Web 入口</h2><p>{{ selectedProject.technologyStack.length ? selectedProject.technologyStack.join(" · ") : "尚未识别技术栈" }}</p></div><Globe2 :size="20" /></div><div class="project-tech-content"><div v-if="selectedProject.technologyStack.length" class="stack-list"><span v-for="stack in selectedProject.technologyStack" :key="stack" class="stack-chip">{{ stack }}</span></div><div v-if="selectedProject.webEndpoints.length" class="project-endpoint-list"><a v-for="endpoint in selectedProject.webEndpoints" :key="endpoint.url + endpoint.serviceName" :href="endpoint.url" target="_blank" rel="noreferrer" class="project-endpoint-row"><span><strong>{{ endpoint.label }}</strong><small>{{ endpoint.serviceName || "项目 Web 入口" }}<span v-if="endpoint.port"> · :{{ endpoint.port }}</span><span v-if="endpoint.notes"> · {{ endpoint.notes }}</span></small></span><ArrowUpRight :size="15" /></a></div><div v-else class="empty-inline">这个项目没有已确认的 Web 入口</div></div></section>
@@ -1013,12 +1355,42 @@ onMounted(() => void refresh());
     <div v-if="showEditor" class="modal-backdrop" @mousedown.self="showEditor = false">
       <form class="editor-modal" @submit.prevent="saveServer">
         <header><div><p class="eyebrow">{{ isEditing ? '编辑资产' : '手动登记' }}</p><h2>{{ isEditing ? '更新 VPS' : '添加 VPS' }}</h2></div><button class="icon-button" type="button" title="关闭" @click="showEditor = false"><X :size="18" /></button></header>
-        <div class="form-grid"><label class="full"><span>显示名称</span><input v-model="form.name" required maxlength="80" placeholder="例如：大阪主站" /></label><label><span>地址</span><input v-model="form.address" required maxlength="253" placeholder="IP 或主机名" /></label><label><span>SSH 端口</span><input v-model.number="form.sshPort" required type="number" min="1" max="65535" /></label><label><span>SSH 用户</span><input v-model="form.sshUser" required maxlength="80" placeholder="ubuntu" /></label><label><span>SSH 网络路径</span><select v-model="form.networkMode"><option value="system">系统路由</option><option value="direct">直连物理网卡（绕过 TUN）</option></select></label><label><span>环境</span><input v-model="form.environment" required maxlength="40" placeholder="production" /></label><label class="full"><span>用途 / 角色</span><input v-model="form.role" maxlength="100" placeholder="例如：Web、数据库、代理节点" /></label><label><span>凭据引用</span><input v-model="form.credentialRef" maxlength="160" placeholder="仅名称，不输入路径或私钥" /></label><label><span>标签</span><input v-model="form.tags" maxlength="200" placeholder="逗号分隔，例如：docker, asia" /></label></div>
+        <div class="form-grid"><label class="full"><span>显示名称</span><input v-model="form.name" required maxlength="80" placeholder="例如：大阪主站" /></label><label><span>地址</span><input v-model="form.address" required maxlength="253" placeholder="IP 或主机名" /></label><label><span>SSH 端口</span><input v-model.number="form.sshPort" required type="number" min="1" max="65535" /></label><label><span>SSH 用户</span><input v-model="form.sshUser" required maxlength="80" placeholder="root 或 ubuntu" /></label><label><span>SSH 网络路径</span><select v-model="form.networkMode"><option value="system">系统路由</option><option value="direct">直连物理网卡（绕过 TUN）</option></select></label><label><span>环境</span><input v-model="form.environment" required maxlength="40" placeholder="production" /></label><label class="full"><span>用途 / 角色</span><input v-model="form.role" maxlength="100" placeholder="例如：Web、数据库、代理节点" /></label><div v-if="!isEditing" class="form-help full"><KeyRound :size="16" /><span><strong>SSH 密钥会在保存后自动生成</strong><small>无需填写私钥。下一步只需在 VPS 的云厂商网页终端或现有登录方式中粘贴一次公钥安装命令。</small></span></div><div v-else class="form-help full"><KeyRound :size="16" /><span><strong>{{ form.credentialRef ? '网关 SSH 凭据已关联' : '尚未完成网关 SSH 绑定' }}</strong><small>私钥不会显示或写入项目目录；需要首次绑定时请在 VPS 详情中点击“绑定 SSH”。</small></span></div><label class="full"><span>标签</span><input v-model="form.tags" maxlength="200" placeholder="逗号分隔，例如：docker, asia" /></label></div>
         <label class="switch-row"><input v-model="form.addHttpCheck" type="checkbox" /><span><strong>附加 HTTP 健康检查</strong><small>按指定状态码判断，不将 Ping 作为前提。</small></span></label>
         <div v-if="form.addHttpCheck" class="form-grid check-fields"><label class="full"><span>健康检查 URL</span><input v-model="form.healthUrl" required type="url" placeholder="https://example.com/health" /></label><label><span>预期状态码</span><input v-model="form.expectedStatusCodes" required placeholder="200, 301, 404" /></label><label><span>检查网络路径</span><select v-model="form.healthCheckNetworkMode"><option value="system">系统路由（域名公开可用性）</option><option value="direct">直连物理网卡（源站检查）</option></select></label></div>
         <label class="switch-row"><input v-model="form.maintenance" type="checkbox" /><span><strong>维护模式</strong><small>保留资产，但探针显示为维护中。</small></span></label>
         <footer><button class="secondary-button" type="button" @click="showEditor = false">取消</button><button class="primary-button" :disabled="isSaving" type="submit"><RefreshCw v-if="isSaving" :size="17" class="spinning" /><Plus v-else :size="17" />{{ isSaving ? '保存中' : isEditing ? '保存更改' : '添加 VPS' }}</button></footer>
       </form>
+    </div>
+
+    <div v-if="showSshBinding && sshBinding" class="modal-backdrop" @mousedown.self="!isTestingSshBinding && (showSshBinding = false)">
+      <section class="binding-modal" role="dialog" aria-modal="true" aria-labelledby="ssh-binding-title">
+        <header><div><p class="eyebrow">{{ sshBinding.binding.status === 'pending' ? '首次 SSH 绑定' : sshBinding.binding.canTest ? 'SSH 连接测试' : 'SSH 已验证' }}</p><h2 id="ssh-binding-title">{{ sshBinding.server.name }}</h2></div><button class="icon-button" type="button" title="关闭" :disabled="isTestingSshBinding" @click="showSshBinding = false"><X :size="18" /></button></header>
+        <div v-if="sshBinding.binding.status === 'pending'" class="binding-body">
+          <div class="binding-steps" aria-label="SSH 绑定步骤"><span class="active"><b>1</b>线上安装公钥</span><span><b>2</b>测试连接</span><span><b>3</b>开始运维</span></div>
+          <p class="binding-intro">网关已在本机为这台 VPS 创建独立 Ed25519 密钥。私钥不会显示、不会写入仓库，也不会交给 Codex 或 Claude。</p>
+          <section class="binding-section"><div><h3>1. 在 VPS 的线上终端执行</h3><p>使用云厂商网页终端、控制台密码登录，或你现有的 SSH 方式登录 <strong>{{ sshBinding.server.sshUser }}@{{ sshBinding.server.address }}</strong> 后，完整粘贴下面一行。</p></div><div class="binding-code"><code>{{ sshBinding.binding.installCommand }}</code><button class="icon-button" type="button" title="复制首次绑定命令" :disabled="copyingPrompt !== null" @click="copySshBindingValue('command')"><Copy :size="17" /></button></div></section>
+          <section class="binding-section compact"><div><h3>公钥</h3><p>若线上终端不便执行命令，可手动追加这一行到该用户的 <code>~/.ssh/authorized_keys</code>。</p></div><div class="binding-code public-key"><code>{{ sshBinding.binding.publicKey }}</code><button class="icon-button" type="button" title="复制 SSH 公钥" :disabled="copyingPrompt !== null" @click="copySshBindingValue('public-key')"><Copy :size="17" /></button></div></section>
+          <div class="binding-warning"><ShieldAlert :size="17" /><span>首次测试会把当前主机的 SSH 指纹登记到本机 <code>known_hosts</code>。后续连接将严格校验该指纹；如服务器重装或主机密钥变更，网关会拒绝连接并要求重新核对。</span></div>
+        </div>
+        <div v-else class="binding-success"><CircleCheckBig :size="28" /><div><h3>{{ sshBinding.binding.canTest ? 'SSH 凭据已关联' : 'SSH 已验证' }}</h3><p>{{ sshBinding.binding.message }}</p><small>{{ sshBinding.binding.canTest ? '可先执行一次测试，确认 root 或普通用户登录、网络路径和主机指纹。' : '现在可进行测活、性能采集、项目盘点和 AI 会话操作。' }}</small></div></div>
+        <footer><button class="secondary-button" type="button" :disabled="isTestingSshBinding" @click="showSshBinding = false">{{ sshBinding.binding.canTest ? '稍后再说' : '完成' }}</button><button v-if="sshBinding.binding.canTest" class="primary-button" type="button" :disabled="isTestingSshBinding" @click="testSshBinding"><RefreshCw v-if="isTestingSshBinding" :size="17" class="spinning" /><KeyRound v-else :size="17" />{{ isTestingSshBinding ? '测试连接中' : sshBinding.binding.status === 'pending' ? '我已完成线上安装，测试绑定' : '测试 SSH 连接' }}</button></footer>
+      </section>
+    </div>
+
+    <div v-if="showMcpSetup && desktopStatus" class="modal-backdrop" @mousedown.self="!isInstallingMcp && (showMcpSetup = false)">
+      <section class="binding-modal mcp-modal" role="dialog" aria-modal="true" aria-labelledby="mcp-setup-title">
+        <header><div><p class="eyebrow">本机 AI 连接</p><h2 id="mcp-setup-title">MCP 设置</h2></div><button class="icon-button" type="button" title="关闭" :disabled="isInstallingMcp !== null" @click="showMcpSetup = false"><X :size="18" /></button></header>
+        <div class="mcp-setup-body">
+          <div class="mcp-status"><span></span><div><strong>本机网关运行中</strong><small>{{ desktopStatus.apiUrl }}{{ desktopStatus.managedByDesktop ? ' · 由桌面应用启动' : ' · 复用现有本机服务' }}</small></div></div>
+          <div class="mcp-client-list">
+            <article class="mcp-client-row"><div><strong>Codex</strong><small>ai-vps-gateway</small></div><div class="mcp-client-actions"><button class="secondary-button" type="button" :disabled="!desktopStatus.packaged || isInstallingMcp !== null" @click="installMcp('codex')"><RefreshCw v-if="isInstallingMcp === 'codex'" :size="16" class="spinning" /><Cable v-else :size="16" />{{ isInstallingMcp === 'codex' ? '配置中' : '安装 MCP' }}</button><button class="icon-button" type="button" title="复制 Codex MCP 命令" :disabled="isInstallingMcp !== null" @click="copyMcpCommand('codex')"><Copy :size="16" /></button></div></article>
+            <article class="mcp-client-row"><div><strong>Claude Code</strong><small>ai-vps-gateway</small></div><div class="mcp-client-actions"><button class="secondary-button" type="button" :disabled="!desktopStatus.packaged || isInstallingMcp !== null" @click="installMcp('claude')"><RefreshCw v-if="isInstallingMcp === 'claude'" :size="16" class="spinning" /><Cable v-else :size="16" />{{ isInstallingMcp === 'claude' ? '配置中' : '安装 MCP' }}</button><button class="icon-button" type="button" title="复制 Claude Code MCP 命令" :disabled="isInstallingMcp !== null" @click="copyMcpCommand('claude')"><Copy :size="16" /></button></div></article>
+          </div>
+          <div v-if="!desktopStatus.packaged" class="binding-warning"><CircleAlert :size="17" /><span>当前为开发运行，安装按钮仅在已打包的桌面应用中启用。</span></div>
+        </div>
+        <footer><button class="secondary-button" type="button" :disabled="isInstallingMcp !== null" @click="showMcpSetup = false">完成</button></footer>
+      </section>
     </div>
 
     <div v-if="showSyncDialog && syncPreview" class="modal-backdrop" @mousedown.self="showSyncDialog = false">

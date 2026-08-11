@@ -82,6 +82,52 @@ describe("network probes", () => {
     assert.equal(result.statusCode, 200);
   });
 
+  it("retries a transient network failure but preserves HTTP error results", async () => {
+    let attempts = 0;
+    const port = await listenHttp((_request, response) => {
+      attempts += 1;
+      if (attempts === 1) {
+        setTimeout(() => {
+          response.writeHead(200);
+          response.end("late");
+        }, 350);
+        return;
+      }
+      response.writeHead(200);
+      response.end("ok");
+    });
+    const result = await probeHttp({
+      id: "retry-check",
+      serverId: "test-server",
+      name: "Retrying health endpoint",
+      kind: "http",
+      enabled: true,
+      config: { url: `http://127.0.0.1:${port}/`, expectedStatusCodes: [200], timeoutMs: 250 }
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.statusCode, 200);
+    assert.equal(attempts, 2);
+    assert.match(result.detail, /重试成功/);
+
+    let httpErrorAttempts = 0;
+    const errorPort = await listenHttp((_request, response) => {
+      httpErrorAttempts += 1;
+      response.writeHead(503);
+      response.end("unavailable");
+    });
+    const httpError = await probeHttp({
+      id: "http-error-check",
+      serverId: "test-server",
+      name: "HTTP error endpoint",
+      kind: "http",
+      enabled: true,
+      config: { url: `http://127.0.0.1:${errorPort}/`, expectedStatusCodes: [200], timeoutMs: 250 }
+    });
+    assert.equal(httpError.ok, false);
+    assert.equal(httpError.statusCode, 503);
+    assert.equal(httpErrorAttempts, 1);
+  });
+
   it("can keep the HTTP host name while connecting to a direct server address", async () => {
     const port = await listenHttp((request, response) => {
       assert.equal(request.headers.host, `direct.example:${port}`);

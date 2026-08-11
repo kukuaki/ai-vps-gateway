@@ -6,6 +6,7 @@ import fastifyStatic from "@fastify/static";
 import { z } from "zod";
 import { applyAllVpsSync, defaultAllVpsSourcePaths, loadAllVpsDocument, previewAllVpsSync, type AllVpsSourcePaths } from "./all-vps.js";
 import { GatewayDatabase } from "./db.js";
+import { redactText } from "./command-policy.js";
 import { discoveredProjectsForInventory } from "./inventory.js";
 import { GatewayOperationError, GatewayOperations, type GatewayOperationOptions } from "./operations.js";
 import { SshExecutor } from "./ssh.js";
@@ -190,6 +191,11 @@ export const DEFAULT_ROOT_ACCESS_DURATION_MS = 8 * 60 * 60_000;
 const emergencyRootSchema = z.object({
   durationMs: z.number().int().min(5 * 60_000).max(DEFAULT_ROOT_ACCESS_DURATION_MS).default(DEFAULT_ROOT_ACCESS_DURATION_MS)
 });
+const serverDeleteSchema = z.object({ confirmed: z.literal(true) });
+const projectDeleteSchema = z.object({
+  cleanupConfirmed: z.literal(true),
+  cleanupSummary: z.string().trim().min(20, "请填写远程清理结果").max(4_000)
+});
 
 function validationError(reply: { code: (status: number) => { send: (payload: unknown) => unknown } }, issues: z.ZodIssue[]): unknown {
   return reply.code(400).send({ error: "ValidationError", message: "请求参数无效", issues });
@@ -358,6 +364,7 @@ class MetricsScheduler {
 export interface GatewayOptions {
   allVpsSourcePaths?: AllVpsSourcePaths;
   operationOptions?: GatewayOperationOptions;
+  staticDirectory?: string;
 }
 
 export async function buildApp(database = new GatewayDatabase(), options: GatewayOptions = {}): Promise<FastifyInstance> {
@@ -396,7 +403,8 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
       server,
       events: database.recentHealthEvents(server.id),
       metric: database.latestMetric(server.id),
-      inventory: database.latestInventory(server.id)
+      inventory: database.latestInventory(server.id),
+      linkedProjects: database.projectsForServer(server.id, true)
     };
   });
 
@@ -443,6 +451,26 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
       status: summary.status
     });
     return { summary, server: database.getServer(server.id) };
+  });
+
+  app.post("/api/servers/:id/ssh/bootstrap", async (request, reply) => {
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return validationError(reply, params.error.issues);
+    try {
+      return await operations.prepareSshBinding(params.data.id);
+    } catch (error) {
+      return operationError(reply, error);
+    }
+  });
+
+  app.post("/api/servers/:id/ssh/test", async (request, reply) => {
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return validationError(reply, params.error.issues);
+    try {
+      return await operations.testSshBinding(params.data.id);
+    } catch (error) {
+      return operationError(reply, error);
+    }
   });
 
   app.post("/api/servers/:id/metrics", async (request, reply) => {
@@ -581,6 +609,18 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     return { archived: true };
   });
 
+  app.post("/api/servers/:id/delete", async (request, reply) => {
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return validationError(reply, params.error.issues);
+    const body = serverDeleteSchema.safeParse(request.body ?? {});
+    if (!body.success) return validationError(reply, body.error.issues);
+    try {
+      return operations.deleteServerRecord(params.data.id);
+    } catch (error) {
+      return operationError(reply, error);
+    }
+  });
+
   app.get("/api/sessions", () => ({ sessions: operations.listSessions() }));
 
   app.post("/api/sessions", (request, reply) => {
@@ -680,6 +720,23 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     return { archived: true };
   });
 
+  app.post("/api/projects/:id/delete", (request, reply) => {
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return validationError(reply, params.error.issues);
+    const body = projectDeleteSchema.safeParse(request.body ?? {});
+    if (!body.success) return validationError(reply, body.error.issues);
+    const project = database.getProject(params.data.id, true);
+    if (!project) return reply.code(404).send({ error: "NotFound", message: "未找到项目" });
+    const deleted = database.deleteProject(project.id);
+    if (!deleted) return reply.code(409).send({ error: "Conflict", message: "项目删除条件发生变化" });
+    database.audit("project.deleted", "project", project.id, "删除项目：" + project.name, "critical", {
+      cleanupSummary: redactText(body.data.cleanupSummary, 4_000).value,
+      serverIds: project.servers.map((server) => server.serverId),
+      serviceCount: project.services.length
+    });
+    return { deleted: true, projectId: deleted.id, projectName: deleted.name };
+  });
+
   app.get("/api/sync/all-vps/preview", (_request, reply) => {
     try {
       return previewAllVpsSync(database, loadAllVpsDocument(allVpsSourcePaths));
@@ -722,7 +779,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     return { alerts: database.recentMetricAlerts(query.data.limit) };
   });
 
-  const distDirectory = resolve(process.cwd(), "dist");
+  const distDirectory = options.staticDirectory ?? resolve(process.cwd(), "dist");
   if (existsSync(distDirectory)) {
     await app.register(fastifyStatic, { root: distDirectory, prefix: "/" });
     app.setNotFoundHandler((request, reply) => {
@@ -744,16 +801,4 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
   });
 
   return app;
-}
-
-async function start(): Promise<void> {
-  const app = await buildApp();
-  await app.listen({ host: "127.0.0.1", port: Number(process.env.PORT ?? 4318) });
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  start().catch((error: unknown) => {
-    console.error(error);
-    process.exitCode = 1;
-  });
 }

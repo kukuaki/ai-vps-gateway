@@ -6,7 +6,7 @@ Local-first VPS inventory, health monitoring, and MCP gateway for personal AI-as
 
 ## Current scope
 
-- Manual VPS inventory with local SQLite persistence.
+- Manual VPS inventory with local SQLite persistence and guided first-run SSH binding for newly added VPS assets.
 - Synchronize VPS inventory and documented domain health checks from an existing `all-vps` directory.
 - Network-safe liveness checks: TCP, SSH banner, and HTTP(S). ICMP is intentionally not required.
 - Health history, current metric snapshots, 30-day metric history, SVG trend charts, threshold alerts, audit events, archive and maintenance states.
@@ -15,7 +15,7 @@ Local-first VPS inventory, health monitoring, and MCP gateway for personal AI-as
 - A local Vue WebUI bound to `127.0.0.1`.
 - A local stdio MCP gateway for Codex and Claude Code. Read operations are available immediately; remote commands require an exclusive gateway session.
 
-The gateway deliberately does **not** read, upload, or expose private key contents. Node resolves only a logical credential reference and lets the local `ssh` process read a key file from the gateway-owned credential directory; the explicit importer performs an opaque local file copy without parsing key bytes.
+The gateway deliberately does **not** read, upload, or expose private key contents. For a new VPS it can create a dedicated Ed25519 keypair in the gateway-owned credential directory; Node returns only the public key and lets the local `ssh` process use the private file. Existing-key imports remain opaque local file copies without parsing key bytes.
 
 ## Security model
 
@@ -27,6 +27,7 @@ The gateway deliberately does **not** read, upload, or expose private key conten
 - Command text and output are redacted before persistence and command records are pruned after 90 days by default. Asset/project summaries and audit events remain in local SQLite.
 - A failed ICMP ping does not mark a VPS offline. SSH/TCP and configured service probes are authoritative.
 - SSH execution never inherits HTTP/SOCKS proxy variables, disables `ProxyCommand` and `ProxyJump`, and can bind selected assets to a physical interface with `networkMode=direct`. This is useful when a macOS TUN client would otherwise make a domestic provider see a proxy egress address. Public HTTP(S) health checks use the system route by default so they validate the actual public-domain path rather than being mistaken for origin SSH traffic.
+- A first-run binding test may use `StrictHostKeyChecking=accept-new` only to record a previously unknown host fingerprint locally. Every later operation requires a strict fingerprint match; a changed known key is never replaced automatically.
 - The `all-vps` synchronizer never reads private keys. Its sync operation preserves the local credential reference and emergency-root state.
 
 ## Requirements
@@ -34,6 +35,7 @@ The gateway deliberately does **not** read, upload, or expose private key conten
 - macOS or Linux
 - Node.js 24+
 - npm 11+
+- OpenSSH client tools: `ssh` and `ssh-keygen`
 
 ## Development
 
@@ -60,6 +62,18 @@ Set `ALLVPS_DATA_DIR` to override it during development or testing.
 
 When the gateway stays running, the metric scheduler collects eligible VPS snapshots every five minutes and retains them for 30 days, including registered root assets. The overview and VPS detail pages show the stored history; CPU at 90% or above, memory at 90% or above, disk at 85% or above, and a transition to unavailable performance create a deduplicated warning audit event.
 
+## macOS Desktop Client
+
+The desktop client combines the local API, MCP adapter support, WebUI, and a macOS menubar resident in one application. Double-clicking the app binds the gateway to `127.0.0.1:4318` and opens the visual interface. Closing or minimizing the window hides it while the local gateway and MCP remain available; click the menubar icon to open the menu, then choose the dashboard, MCP settings, data directory, or exit. On exit it stops only the local gateway process started by that app; it never stops a remote VPS service. Runtime data and credentials remain in the user data directory and are not bundled into the application.
+
+Build an arm64 package on an Apple Silicon Mac:
+
+```bash
+npm run package:desktop
+```
+
+Artifacts are written to `release/` as `.dmg` and `.zip` files. During development, `npm run run:desktop` opens the built desktop window. The app icon, WebUI brand mark, and menubar template are packaged separately so macOS can use the correct icon treatment in each location. The MCP setup button in the top-right corner can register Codex or Claude Code with one click; standard MCP connections are still spawned by the respective AI client over stdio, and the client reaches remote hosts only through the local gateway API.
+
 SSH execution uses these local-only defaults:
 
 ```text
@@ -67,7 +81,9 @@ SSH execution uses these local-only defaults:
 ~/.ssh/known_hosts
 ```
 
-Put a user-managed key file in the credential directory, then set a VPS `credentialRef` to its filename only. The reference cannot contain a path. The gateway checks file metadata and permissions but never reads the key contents. Set `ALLVPS_CREDENTIAL_DIR` or `ALLVPS_KNOWN_HOSTS_FILE` to use another location. SSH host keys must already be present in `known_hosts`; the gateway refuses to silently trust a new host key.
+For a newly added VPS, the WebUI creates a dedicated Ed25519 pair automatically. It shows only the public key and an idempotent one-line installation command. Use a cloud-provider Web console, an existing SSH login, or another already-authorized path once to run that command as the selected SSH user, then click **Test binding** in the WebUI. A successful non-interactive SSH test stores the logical key reference and unlocks sessions, inventory, and metrics. The private key stays in the gateway directory with mode `0600`; it is never shown in the UI, copied into the repository, or handed to an AI client.
+
+The first successful test accepts a new host key into local `known_hosts`; subsequent operations require an exact match and fail if the server was reinstalled or its host key changed. Existing manually imported keys continue to work through their logical `credentialRef`. Set `ALLVPS_CREDENTIAL_DIR` or `ALLVPS_KNOWN_HOSTS_FILE` to use another location.
 
 ## Synchronizing an Existing all-vps Inventory
 
@@ -91,7 +107,7 @@ Synchronization identifies an asset by SSH address and port, then updates docume
 
 ## Synchronizing Remote Projects
 
-The project inventory is a read-only SSH operation. It collects bounded metadata only: hostname, OS, Docker container names/images/status/port mappings/mounts, non-baseline systemd units, PM2 or Node process names/PIDs/working directories/listening ports, project manifest paths and dependency names, plus filtered Web routing directives (`server_name`, `listen`, `proxy_pass`, and `root`). It does not read environment variables, logs, private keys, tokens, or complete configuration files. Nginx routes are associated with a project through the static root, upstream port, process working directory, and service manager evidence; a domain is therefore stored as a project Web endpoint instead of becoming a standalone project. The result is stored locally and used to create or update deterministic `remote-inventory` projects with technology-stack labels, project-level Web endpoints when discovered, detailed services, and overview, deployment, verification, troubleshooting, and guardrail sections. Missing automatic projects are archived rather than deleted, and a warning-bearing partial inventory does not archive anything.
+The project inventory is a read-only SSH operation. It collects bounded metadata only: hostname, OS, Docker container names/images/status/port mappings/mounts, non-baseline systemd units, PM2 or Node process names/PIDs/working directories/listening ports, project manifest paths and dependency names, plus filtered active Nginx routing directives (`server_name`, `listen`, `proxy_pass`, and `root`). It does not read environment variables, logs, private keys, tokens, or complete configuration files. Nginx routes are associated with a project through the static root, upstream port, process working directory, and service manager evidence; a domain is therefore stored as a project Web endpoint instead of becoming a standalone project. Server-level health-check domains are used only for VPS liveness and are never attached to a project by assumption; `acme`, `letsencrypt`, and `certbot` challenge roots are also excluded as site entries. A public S-UI Docker mapping on `2095/tcp` is recorded as its default panel URL, `http://<server>:2095/app/`; the subscription port is not treated as a normal Web endpoint. The result is stored locally and used to create or update deterministic `remote-inventory` projects with technology-stack labels, project-level Web endpoints when discovered, detailed services, and overview, deployment, verification, troubleshooting, and guardrail sections. Missing automatic projects are archived rather than deleted; after a successful complete inventory pass, their historical records are detached from live VPS associations, while a warning-bearing partial inventory does not archive anything.
 
 ```bash
 npm run sync:vps-projects
@@ -129,11 +145,32 @@ Start the local API first, then register the stdio adapter with your client:
 }
 ```
 
-Available tools include `list_servers`, `get_server`, `get_dashboard`, `list_projects`, `get_project`, `list_sessions`, `open_session`, `get_session`, `run_command`, `close_session`, `collect_metrics`, `collect_all_metrics`, `get_metric_history`, `list_metric_alerts`, `sync_server_projects`, and `sync_all_vps_projects`.
+With the macOS desktop client, the AI client does not need to start Node/npm. Open `AI VPS Gateway.app` from the desktop, then use the MCP setup button in the top-right corner to register it. The equivalent stdio configuration is:
 
-The normal execution flow is: open a session, wait if it is queued, run commands through `run_command`, collect current metrics when needed, then close the session. A root VPS follows the same flow after normal credential and host-key checks; the optional WebUI root-rescue marker is only an additional warning and audit signal. The API and MCP adapter remain bound to `127.0.0.1`; the AI client receives neither a private key nor an unrestricted local SSH path.
+```json
+{
+  "mcpServers": {
+    "ai-vps-gateway": {
+      "command": "/Users/kukuaki/Desktop/AI VPS Gateway.app/Contents/MacOS/AI VPS Gateway",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
 
-Each project runbook has five sections: overview, deployment, verification, troubleshooting, and guardrails. It is stored in local SQLite and exposed to later AI sessions through read-only MCP queries. Do not put passwords, tokens, private keys, or complete environment variables in a runbook.
+When the desktop window is hidden, its local API and MCP remain available. Choose `退出` from the menubar menu to stop the local gateway owned by the app.
+
+Available tools include `list_servers`, `get_server`, `get_dashboard`, `prepare_ssh_binding`, `test_ssh_binding`, `list_projects`, `get_project`, `create_project`, `update_project`, `delete_project`, `delete_server`, `list_sessions`, `open_session`, `get_session`, `run_command`, `close_session`, `collect_metrics`, `collect_all_metrics`, `get_metric_history`, `list_metric_alerts`, `sync_server_projects`, and `sync_all_vps_projects`.
+
+For a new unbound VPS, an agent can call `prepare_ssh_binding`, ask the user to run the returned public-key installation command through a cloud console or existing login, then call `test_ssh_binding`. The normal execution flow is: open a session, wait if it is queued, run commands through `run_command`, collect current metrics when needed, then close the session. A root VPS follows the same flow after normal credential and host-key checks; the optional WebUI root-rescue marker is only an additional warning and audit signal. The API and MCP adapter remain bound to `127.0.0.1`; the AI client receives neither a private key nor an unrestricted local SSH path.
+
+Each project runbook has five sections: overview, deployment, verification, troubleshooting, and guardrails. It is stored in local SQLite, can be read by later AI sessions, and can be created or updated through explicit local-only MCP project tools. Do not put passwords, tokens, private keys, or complete environment variables in a runbook. The WebUI also copies contextual project-management, VPS-management, and new-project prompts without exposing credentials.
+
+### Deletion workflow
+
+The WebUI requires two confirmations before copying either deletion prompt. The project prompt requires the agent to inventory, clean, and verify remote services through the gateway before calling `delete_project`; shared Nginx, `sing-box`, VLESS/Reality, Shadowsocks/SS, and Cloudflare node routes must be preserved. `delete_project` removes only the local project record and never substitutes for remote cleanup.
+
+The VPS deletion prompt also requires two confirmations. `delete_server` removes a local VPS record only when it has no project links and no active or queued sessions; it never deletes the remote host. A complete inventory pass detaches stale archived automatic records from live associations but retains them for history; any remaining archived or manual link still blocks deletion.
 
 For this checkout, start the local API/WebUI and register the stdio server with the clients:
 

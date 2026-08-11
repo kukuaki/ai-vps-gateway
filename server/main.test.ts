@@ -1,10 +1,12 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildApp, DEFAULT_ROOT_ACCESS_DURATION_MS } from "./main.js";
+import { CredentialStore } from "./credentials.js";
 import { GatewayDatabase } from "./db.js";
+import { SshExecutor } from "./ssh.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -15,6 +17,64 @@ afterEach(() => {
 });
 
 describe("local API", () => {
+  it("generates a gateway-owned SSH key, returns only public bootstrap data, and binds after a non-interactive test", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-ssh-binding-"));
+    temporaryDirectories.push(directory);
+    const credentialsDirectory = join(directory, "credentials");
+    const knownHostsPath = join(directory, "known_hosts");
+    const capturePath = join(directory, "ssh-arguments.txt");
+    const fakeSshPath = join(directory, "fake-ssh.sh");
+    writeFileSync(fakeSshPath, ["#!/bin/sh", `printf '%s' "$*" > ${capturePath}`].join("\n"));
+    chmodSync(fakeSshPath, 0o755);
+
+    const database = new GatewayDatabase(directory);
+    const store = new CredentialStore(credentialsDirectory, knownHostsPath);
+    const app = await buildApp(database, {
+      operationOptions: {
+        sshExecutor: new SshExecutor({ credentialStore: store, sshBinary: fakeSshPath, directInterface: "en0" })
+      }
+    });
+    await app.ready();
+
+    const createdResponse = await app.inject({
+      method: "POST",
+      url: "/api/servers",
+      payload: { name: "首次绑定节点", address: "203.0.113.61", sshPort: 22, sshUser: "root", networkMode: "direct" }
+    });
+    assert.equal(createdResponse.statusCode, 201);
+    const created = createdResponse.json() as { server: { id: string; credentialRef: string | null } };
+    assert.equal(created.server.credentialRef, null);
+
+    const bootstrapResponse = await app.inject({ method: "POST", url: `/api/servers/${created.server.id}/ssh/bootstrap` });
+    assert.equal(bootstrapResponse.statusCode, 200);
+    const bootstrap = bootstrapResponse.json() as { binding: { status: string; canTest: boolean; publicKey: string | null; installCommand: string | null } };
+    assert.equal(bootstrap.binding.status, "pending");
+    assert.equal(bootstrap.binding.canTest, true);
+    assert.match(bootstrap.binding.publicKey ?? "", /^ssh-ed25519 /);
+    assert.match(bootstrap.binding.installCommand ?? "", /authorized_keys/);
+    assert.equal(database.getServer(created.server.id)?.credentialRef, null);
+    const generatedReference = `gateway-generated-${created.server.id}.ed25519`;
+    assert.equal(lstatSync(join(credentialsDirectory, generatedReference)).mode & 0o777, 0o600);
+
+    const testResponse = await app.inject({ method: "POST", url: `/api/servers/${created.server.id}/ssh/test` });
+    assert.equal(testResponse.statusCode, 200);
+    const bound = testResponse.json() as { server: { credentialRef: string | null }; binding: { status: string; canTest: boolean; publicKey: string | null; installCommand: string | null } };
+    assert.equal(bound.binding.status, "bound");
+    assert.equal(bound.binding.canTest, false);
+    assert.equal(bound.binding.publicKey, null);
+    assert.equal(bound.binding.installCommand, null);
+    assert.equal(bound.server.credentialRef, generatedReference);
+    assert.equal(store.hasKnownHosts(), true);
+    const sshArguments = readFileSync(capturePath, "utf8");
+    assert.match(sshArguments, /StrictHostKeyChecking=accept-new/);
+    assert.match(sshArguments, /ProxyCommand=none/);
+    const existingCredentialResponse = await app.inject({ method: "POST", url: `/api/servers/${created.server.id}/ssh/bootstrap` });
+    assert.equal(existingCredentialResponse.statusCode, 200);
+    assert.equal(existingCredentialResponse.json().binding.canTest, true);
+    assert.equal(database.recentAudit().some((event) => event.action === "server.ssh.bound"), true);
+    await app.close();
+  });
+
   it("creates and archives a server through the manual management API", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-"));
     temporaryDirectories.push(directory);
@@ -149,11 +209,74 @@ describe("local API", () => {
 
     const archiveResponse = await app.inject({ method: "POST", url: `/api/projects/${project.project.id}/archive` });
     assert.equal(archiveResponse.statusCode, 200);
-    assert.equal(database.listProjects().length, 0);
+   assert.equal(database.listProjects().length, 0);
+   await app.close();
+ });
+
+  it("requires remote cleanup confirmation and protects VPS project associations", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-delete-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const app = await buildApp(database);
+    await app.ready();
+
+    const serverResponse = await app.inject({
+      method: "POST",
+      url: "/api/servers",
+      payload: { name: "待删除节点", address: "203.0.113.32", sshPort: 22, sshUser: "ubuntu" }
+    });
+    const server = serverResponse.json() as { server: { id: string } };
+    const projectResponse = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload: {
+        name: "待清理项目",
+        description: "删除流程测试",
+        servers: [{ serverId: server.server.id, role: "primary" }],
+        services: [{ serverId: server.server.id, name: "test-service", manager: "systemd", identifier: "test.service" }]
+      }
+    });
+    const project = projectResponse.json() as { project: { id: string } };
+
+    const detailResponse = await app.inject({ method: "GET", url: "/api/servers/" + server.server.id });
+    assert.equal(detailResponse.statusCode, 200);
+    assert.equal(detailResponse.json().linkedProjects.length, 1);
+    const blockedServerDelete = await app.inject({
+      method: "POST",
+      url: "/api/servers/" + server.server.id + "/delete",
+      payload: { confirmed: true }
+    });
+    assert.equal(blockedServerDelete.statusCode, 409);
+    assert.equal(blockedServerDelete.json().error, "ServerHasProjects");
+
+    const invalidProjectDelete = await app.inject({
+      method: "POST",
+      url: "/api/projects/" + project.project.id + "/delete",
+      payload: { cleanupConfirmed: false, cleanupSummary: "未完成" }
+    });
+    assert.equal(invalidProjectDelete.statusCode, 400);
+
+    const projectDelete = await app.inject({
+      method: "POST",
+      url: "/api/projects/" + project.project.id + "/delete",
+      payload: { cleanupConfirmed: true, cleanupSummary: "已停止并验证 test.service，确认远程项目服务不存在。" }
+    });
+    assert.equal(projectDelete.statusCode, 200);
+    assert.equal(projectDelete.json().deleted, true);
+
+    const serverDelete = await app.inject({
+      method: "POST",
+      url: "/api/servers/" + server.server.id + "/delete",
+      payload: { confirmed: true }
+    });
+    assert.equal(serverDelete.statusCode, 200);
+    assert.equal(serverDelete.json().deleted, true);
+    assert.equal(database.getServer(server.server.id, true), null);
+    assert.equal(database.getProject(project.project.id, true), null);
     await app.close();
   });
 
-  it("serves metric history and performance alerts", async () => {
+ it("serves metric history and performance alerts", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-metrics-"));
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);

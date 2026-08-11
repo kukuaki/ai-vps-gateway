@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { GatewayDatabase } from "./db.js";
-import { discoveredProjectsForInventory, parseInventoryOutput } from "./inventory.js";
+import { INVENTORY_COMMAND, discoveredProjectsForInventory, parseInventoryOutput } from "./inventory.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -44,6 +44,12 @@ describe("remote project inventory", () => {
     assert.equal(first.project.services.length, 1);
     const second = database.syncDiscoveredProject(discovered[0]!);
     assert.equal(second.action, "unchanged");
+    const refreshed = database.syncDiscoveredProject({
+      ...discovered[0]!,
+      technologyStack: ["Nginx", "sing-box"]
+    });
+    assert.equal(refreshed.action, "updated");
+    assert.deepEqual(refreshed.project.technologyStack, ["Nginx", "sing-box"]);
     const stale = database.syncDiscoveredProject({
       ...discovered[0]!,
       sourceKey: server.id + ":stale",
@@ -51,6 +57,8 @@ describe("remote project inventory", () => {
     });
     assert.equal(stale.action, "created");
     assert.equal(database.archiveMissingDiscoveredProjects(server.id, [discovered[0]!.sourceKey]), 1);
+    assert.deepEqual(database.projectsForServer(server.id, true).map((project) => project.id), [first.project.id]);
+    assert.equal(database.getProject(stale.project.id, true)?.services.length, 0);
     database.close();
   });
 
@@ -107,7 +115,16 @@ describe("remote project inventory", () => {
     assert.ok(zongde.services?.some((service) => service.name === "zongde-nginx" && service.portMappings?.includes("443/tcp -> 0.0.0.0:443")));
     assert.equal(sui.services?.length, 1);
     assert.ok(sui.technologyStack?.includes("S-UI"));
-    assert.equal(sui.webEndpoints?.length, 0);
+    assert.deepEqual(sui.webEndpoints, [
+      {
+        label: "S-UI 管理面板",
+        url: "http://203.0.113.71:2095/app/",
+        port: 2095,
+        serviceName: "s-ui",
+        notes: "S-UI 默认管理路径；由公网 Docker 端口映射识别，请确认登录认证和防火墙策略。",
+        source: "remote-inventory"
+      }
+    ]);
     const saved = database.syncDiscoveredProject(zongde);
     assert.deepEqual(saved.project.webEndpoints, zongde.webEndpoints);
     assert.deepEqual(saved.project.technologyStack, zongde.technologyStack);
@@ -127,10 +144,12 @@ describe("remote project inventory", () => {
       "PROJECT\tnode\t/opt/payment_approval/package.json",
       "SERVICE\tprocess\tpm2:payment-api\tpayment-api\tonline\t127.0.0.1:3334\t/opt/payment_approval/server\tpm2\t/opt/payment_approval/server\t",
       "SERVICE\tsystemd\tnginx.service\tactive / running\t\t\t/usr/lib/systemd/system/nginx.service\t\t\t",
-      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf\tserver_name pay.kukuaki.me;",
-      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf\tlisten 443 ssl;",
-      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf\troot /opt/payment_approval/client/dist;",
-      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf\tproxy_pass http://127.0.0.1:3334/api/;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf#server-1\tlisten 80;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf#server-1\tserver_name pay.kukuaki.me;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf#server-2\tserver_name pay.kukuaki.me;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf#server-2\tlisten 443 ssl;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf#server-2\troot /opt/payment_approval/client/dist;",
+      "WEB\tnginx\t/etc/nginx/conf.d/pay.kukuaki.me.conf#server-2\tproxy_pass http://127.0.0.1:3334/api/;",
       "PORT\ttcp\t0.0.0.0:443",
       "PORT\ttcp\t127.0.0.1:3334",
       ""
@@ -150,6 +169,94 @@ describe("remote project inventory", () => {
     assert.ok(payment.runbook.overview.includes("pay.kukuaki.me -> payment-api"));
     assert.equal(database.syncDiscoveredProject(payment).action, "created");
     assert.equal(database.syncDiscoveredProject(payment).action, "unchanged");
+    database.close();
+  });
+
+  it("creates a PM2 project from its working directory when no manifest was found", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-inventory-process-project-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "新加坡节点", address: "203.0.113.75", sshPort: 22, sshUser: "ubuntu" });
+    const inventory = parseInventoryOutput(server.id, [
+      "__AI_VPS_GATEWAY_INVENTORY_V2__",
+      "SERVICE\tprocess\tpm2:zhongde\tzhongde\tonline\t\t/www/zhongde\tzhongde\t/www/zhongde\t",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/zhongde.kukuaki.me#server-1\tserver_name zhongde.kukuaki.me;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/zhongde.kukuaki.me#server-1\tlisten 80;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/zhongde.kukuaki.me#server-1\tproxy_pass http://127.0.0.1:3000;",
+      ""
+    ].join("\n"));
+    const discovered = discoveredProjectsForInventory(server, inventory);
+    assert.equal(discovered.length, 1);
+    assert.equal(discovered[0]?.name, "新加坡节点 · zongde");
+    assert.equal(discovered[0]?.repositoryPath, "/www/zhongde");
+    assert.ok(discovered[0]?.services?.some((service) => service.identifier === "pm2:zhongde"));
+    assert.deepEqual(discovered[0]?.webEndpoints?.map((endpoint) => endpoint.url), ["http://zhongde.kukuaki.me"]);
+    database.close();
+  });
+
+  it("does not attach a server health-check domain to an unrelated project", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-inventory-health-domain-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({
+      name: "新加坡节点",
+      address: "203.0.113.76",
+      sshPort: 22,
+      sshUser: "ubuntu",
+      healthChecks: [{
+        name: "Cloudflare node",
+        kind: "http",
+        config: { url: "https://cf-singapore.example.com", expectedStatusCodes: [200] }
+      }]
+    });
+    const inventory = parseInventoryOutput(server.id, [
+      "__AI_VPS_GATEWAY_INVENTORY_V2__",
+      "SERVICE\tprocess\tpm2:zhongde\tzhongde\tonline\t\t/www/zhongde\tzhongde\t/www/zhongde\t",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/zhongde.example.com#server-1\tserver_name zhongde.example.com;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/zhongde.example.com#server-1\tlisten 80;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/zhongde.example.com#server-1\tproxy_pass http://127.0.0.1:3000;",
+      ""
+    ].join("\n"));
+    const discovered = discoveredProjectsForInventory(server, inventory);
+    assert.equal(discovered.length, 1);
+    assert.deepEqual(discovered[0]?.webEndpoints?.map((endpoint) => endpoint.url), ["http://zhongde.example.com"]);
+    assert.ok(!discovered.some((project) => project.webEndpoints?.some((endpoint) => endpoint.url.includes("cf-singapore"))));
+    database.close();
+  });
+
+  it("reads enabled Nginx server blocks and associates contest endpoints without treating ACME roots as sites", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-inventory-contest-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "国内节点", address: "203.0.113.74", sshPort: 22, sshUser: "ubuntu" });
+    const inventory = parseInventoryOutput(server.id, [
+      "__AI_VPS_GATEWAY_INVENTORY_V2__",
+      "PROJECT\tnode\t/opt/contest-admin/package.json",
+      "SERVICE\tsystemd\tcontest-admin.service\tactive / running\t\t\t/etc/systemd/system/contest-admin.service\t\t/opt/contest-admin\t",
+      "SERVICE\tsystemd\tnginx.service\tactive / running\t\t\t/usr/lib/systemd/system/nginx.service\t\t\t",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-1\tlisten 80;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-1\tserver_name admin.test.kukuaki.me download.test.kukuaki.me;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-1\troot /var/www/letsencrypt;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-2\tlisten 443 ssl;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-2\tserver_name admin.test.kukuaki.me;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-2\tproxy_pass http://127.0.0.1:3000;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-3\tlisten 443 ssl;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-3\tserver_name download.test.kukuaki.me;",
+      "WEB\tnginx\t/etc/nginx/sites-enabled/contest-admin#server-3\troot /home/download;",
+      ""
+    ].join("\n"));
+
+    assert.equal(inventory.webRoutes.length, 3);
+    assert.ok(inventory.webRoutes.every((route) => route.configPath === "/etc/nginx/sites-enabled/contest-admin"));
+    const contest = discoveredProjectsForInventory(server, inventory).find((project) => project.name === "国内节点 · contest-admin");
+    assert.ok(contest);
+    assert.deepEqual(contest.webEndpoints?.map((endpoint) => endpoint.url), [
+      "https://admin.test.kukuaki.me",
+      "https://download.test.kukuaki.me"
+    ]);
+    assert.ok(contest.webEndpoints?.every((endpoint) => !endpoint.notes.includes("letsencrypt")));
+    assert.ok(INVENTORY_COMMAND.includes('find -L "$root"'));
+    assert.ok(INVENTORY_COMMAND.includes('$root/sites-enabled/*'));
     database.close();
   });
 
@@ -177,6 +284,31 @@ describe("remote project inventory", () => {
     assert.ok(discovered[0]?.services?.some((service) => service.name === "nginx"));
     assert.ok(discovered[0]?.services?.some((service) => service.name === "sing-box"));
     assert.ok(!discovered.some((project) => project.sourceKey.includes(":web:")));
+    database.close();
+  });
+
+  it("prefers a Cloudflare node's HTTPS proxy route over its certbot challenge route", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-inventory-certbot-route-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "代理节点", address: "203.0.113.77", sshPort: 22, sshUser: "root" });
+    const inventory = parseInventoryOutput(server.id, [
+      "__AI_VPS_GATEWAY_INVENTORY_V2__",
+      "SERVICE\tsystemd\tnginx.service\tactive / running\t\t\t/usr/lib/systemd/system/nginx.service\t\t\t",
+      "SERVICE\tsystemd\tsing-box.service\tactive / running\t\t\t/usr/lib/systemd/system/sing-box.service\t\t\t",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf#server-1\tserver_name cf-node.example.com;",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf#server-1\tlisten 80;",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf#server-1\troot /var/www/certbot;",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf#server-2\tserver_name cf-node.example.com;",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf#server-2\tlisten 443 ssl;",
+      "WEB\tnginx\t/etc/nginx/conf.d/cf-node.example.com.conf#server-2\tproxy_pass http://127.0.0.1:10085;",
+      ""
+    ].join("\n"));
+
+    const discovered = discoveredProjectsForInventory(server, inventory);
+    assert.equal(discovered.length, 1);
+    assert.deepEqual(discovered[0]?.webEndpoints?.map((endpoint) => endpoint.url), ["https://cf-node.example.com"]);
+    assert.ok(discovered[0]?.webEndpoints?.[0]?.notes.includes("127.0.0.1:10085"));
     database.close();
   });
 });

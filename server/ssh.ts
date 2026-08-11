@@ -23,6 +23,10 @@ export interface SshExecutorOptions {
   directInterface?: string | null;
 }
 
+export interface SshExecuteOptions {
+  hostKeyPolicy?: "strict" | "accept-new";
+}
+
 function boundedTimeout(value: number | undefined): number {
   return Math.min(Math.max(value ?? 10_000, 1_000), 600_000);
 }
@@ -50,10 +54,17 @@ export class SshExecutor {
     this.directInterface = options.directInterface === undefined ? detectDirectInterface() : normalizeDirectInterface(options.directInterface);
   }
 
-  async execute(server: ServerRecord, command: string, timeoutMs = this.defaultTimeoutMs): Promise<SshExecutionResult> {
+  async execute(
+    server: ServerRecord,
+    command: string,
+    timeoutMs = this.defaultTimeoutMs,
+    options: SshExecuteOptions = {}
+  ): Promise<SshExecutionResult> {
     const credentialPath = this.credentialStore.pathFor(server);
+    const hostKeyPolicy = options.hostKeyPolicy ?? "strict";
     if (!this.credentialStore.hasKnownHosts()) {
-      throw new Error("本机没有可用的 SSH known_hosts，网关拒绝在未校验主机指纹的情况下连接");
+      if (hostKeyPolicy === "accept-new") this.credentialStore.ensureKnownHosts();
+      else throw new Error("本机没有可用的 SSH known_hosts，网关拒绝在未校验主机指纹的情况下连接");
     }
     if (server.networkMode === "direct" && !this.directInterface) {
       throw new Error("直连模式找不到可用的物理网卡；请设置 ALLVPS_SSH_DIRECT_INTERFACE，例如 en0");
@@ -84,7 +95,7 @@ export class SshExecutor {
       "-o",
       "ControlPath=none",
       "-o",
-      "StrictHostKeyChecking=yes",
+      `StrictHostKeyChecking=${hostKeyPolicy === "accept-new" ? "accept-new" : "yes"}`,
       "-o",
       `UserKnownHostsFile=${this.credentialStore.knownHostsPath}`,
       "-o",

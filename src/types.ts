@@ -123,6 +123,29 @@ export interface ServerDetail {
   events: HealthEvent[];
   metric: MetricSnapshot | null;
   inventory: ServerInventory | null;
+  linkedProjects: ServerProjectReference[];
+}
+
+export interface ServerProjectReference {
+  id: string;
+  name: string;
+  source: "manual" | "remote-inventory";
+  archivedAt: string | null;
+}
+
+export type SshBindingStatus = "pending" | "bound";
+
+export interface SshBindingInfo {
+  status: SshBindingStatus;
+  canTest: boolean;
+  publicKey: string | null;
+  installCommand: string | null;
+  message: string;
+}
+
+export interface SshBindingResponse {
+  server: ServerRecord;
+  binding: SshBindingInfo;
 }
 
 export interface RemoteInventoryProject {

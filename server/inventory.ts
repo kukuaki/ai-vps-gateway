@@ -209,15 +209,45 @@ PY
   fi
 done
 
-for root in /etc/nginx /etc/zhongde/nginx /etc/caddy /etc/traefik; do
-  if [ -d "$root" ]; then
-    find "$root" -maxdepth 5 -type f \( -name '*.conf' -o -name 'Caddyfile' -o -name '*.yaml' -o -name '*.yml' \) -print 2>/dev/null
-  fi
+for root in /etc/nginx /etc/zhongde/nginx; do
+  [ -d "$root" ] || continue
+  find -L "$root" -maxdepth 5 \
+    \( -path "$root/sites-available" -o -path "$root/sites-available/*" \) -prune -o \
+    -type f \( -name '*.conf' -o -path "$root/sites-enabled/*" \) -print 2>/dev/null
 done | sort -u | while IFS= read -r path; do
-  grep -hE '^[[:space:]]*(server_name|listen|proxy_pass|root)[[:space:]]' "$path" 2>/dev/null | while IFS= read -r line; do
-    line=$(printf '%s' "$line" | tr '\r\n\t' '   ' | cut -c1-500)
-    printf 'WEB\tnginx\t%s\t%s\n' "$path" "$line"
-  done
+  awk '
+function brace_delta(value, copy, opened, closed) {
+  copy = value
+  opened = gsub(/\{/, "", copy)
+  copy = value
+  closed = gsub(/\}/, "", copy)
+  return opened - closed
+}
+{
+  line = $0
+  sub(/[[:space:]]*#.*/, "", line)
+  if (!inside) {
+    if (line ~ /^[[:space:]]*server[[:space:]]*\{/) {
+      scope += 1
+      depth = brace_delta(line)
+      inside = 1
+    }
+    next
+  }
+  if (line ~ /^[[:space:]]*(server_name|listen|proxy_pass|root)[[:space:]]/) {
+    gsub(/[\t\r]/, " ", line)
+    printf "%s#server-%d\t%s\n", FILENAME, scope, substr(line, 1, 500)
+  }
+  depth += brace_delta(line)
+  if (depth <= 0) {
+    depth = 0
+    inside = 0
+  }
+}
+' "$path"
+done | while IFS= read -r route; do
+  [ -n "$route" ] || continue
+  printf 'WEB\tnginx\t%s\n' "$route"
 done`;
 
 const HEADERS = new Set(["__AI_VPS_GATEWAY_INVENTORY_V1__", "__AI_VPS_GATEWAY_INVENTORY_V2__"]);
@@ -266,6 +296,21 @@ function projectFromManifest(serverId: string, kind: string, path: string): Remo
     name: projectDisplayName(directory, basename(directory) || directory),
     path: directory,
     manifest: `${kind}:${manifest}`,
+    technologyStack: [],
+    webEndpoints: []
+  };
+}
+
+function projectFromProcessService(serverId: string, service: RemoteInventoryService): RemoteInventoryProject | null {
+  if (service.manager !== "process") return null;
+  const hint = cleanField(service.projectHint ?? "", 100);
+  const path = normalizedProjectPath(service.workingDirectory ?? service.projectPath ?? "");
+  if (!hint || !path || /^(?:app|node|npm|pm2|server|process|unknown)$/i.test(hint)) return null;
+  return {
+    key: serverId + ":" + path,
+    name: projectDisplayName(path, hint),
+    path,
+    manifest: "process:" + service.identifier,
     technologyStack: [],
     webEndpoints: []
   };
@@ -434,6 +479,7 @@ function upstreamPortOf(upstream: string | null): number | null {
 
 function endpointFromRoute(route: RemoteInventoryWebRoute, hostname: string): ProjectWebEndpoint | null {
   if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(hostname)) return null;
+  if (!route.upstream && route.root && /(?:^|\/)(?:acme|letsencrypt|certbot)(?:\/|$)/i.test(route.root)) return null;
   const port = route.ports.includes(443) ? 443 : route.ports[0] ?? 80;
   const details = [
     route.upstream ? "上游：" + route.upstream : null,
@@ -450,21 +496,29 @@ function endpointFromRoute(route: RemoteInventoryWebRoute, hostname: string): Pr
   };
 }
 
-function endpointFromHealthCheck(check: ServerRecord["healthChecks"][number]): ProjectWebEndpoint | null {
-  if (check.kind !== "http" || !check.config.url) return null;
-  try {
-    const parsed = new URL(check.config.url);
-    return {
-      label: parsed.hostname,
-      url: parsed.toString().replace(/\/$/, ""),
-      port: parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80,
-      serviceName: null,
-      notes: "来源：all-vps 域名健康检查",
-      source: "remote-inventory"
-    };
-  } catch {
-    return null;
-  }
+function hasPublicTcpPortMapping(service: RemoteInventoryService, port: number): boolean {
+  const mapping = new RegExp(`(?:^|[;\\s])${port}/tcp\\s*->\\s*(?:0\\.0\\.0\\.0|\\[::\\]|::):${port}(?:$|[;\\s])`, "i");
+  return service.portMappings.some((value) => mapping.test(value));
+}
+
+function sUiPanelEndpoints(project: RemoteInventoryProject, server: ServerRecord, services: RemoteInventoryService[]): ProjectWebEndpoint[] {
+  const projectValue = `${project.name} ${project.manifest}`;
+  const isSuiProject = /(?:^|[^a-z])s-?ui(?:$|[^a-z])/i.test(projectValue) || services.some((service) =>
+    /(?:^|[^a-z])s-?ui(?:$|[^a-z])/i.test(`${service.name} ${service.image ?? ""}`)
+  );
+  if (!isSuiProject) return [];
+  const host = server.address.includes(":") && !server.address.startsWith("[") ? `[${server.address}]` : server.address;
+  return services
+    .filter((service) => /(?:^|[^a-z])s-?ui(?:$|[^a-z])/i.test(`${service.name} ${service.image ?? ""}`))
+    .filter((service) => hasPublicTcpPortMapping(service, 2095))
+    .map((service) => ({
+      label: "S-UI 管理面板",
+      url: `http://${host}:2095/app/`,
+      port: 2095,
+      serviceName: service.name,
+      notes: "S-UI 默认管理路径；由公网 Docker 端口映射识别，请确认登录认证和防火墙策略。",
+      source: "remote-inventory" as const
+    }));
 }
 
 function dedupeEndpoints(endpoints: ProjectWebEndpoint[]): ProjectWebEndpoint[] {
@@ -475,6 +529,14 @@ function dedupeEndpoints(endpoints: ProjectWebEndpoint[]): ProjectWebEndpoint[] 
     if (!existing || (!existing.serviceName && endpoint.serviceName)) result.set(endpoint.url, endpoint);
   }
   return [...result.values()].sort((left, right) => left.url.localeCompare(right.url));
+}
+
+function endpointHostname(endpoint: ProjectWebEndpoint): string | null {
+  try {
+    return new URL(endpoint.url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
 }
 
 function serviceInput(server: ServerRecord, service: RemoteInventoryService): ProjectServiceInput {
@@ -578,16 +640,8 @@ function endpointsForProject(
       if (endpoint) endpoints.push(endpoint);
     }
   }
-  const healthEndpoints = server.healthChecks
-    .map(endpointFromHealthCheck)
-    .filter((endpoint): endpoint is ProjectWebEndpoint => Boolean(endpoint))
-    .filter((endpoint) => {
-      if (inventory.projects.length === 1) return true;
-      const endpointToken = normalizedProjectName(endpoint.label);
-      const projectToken = normalizedProjectName(project.name);
-      return projectToken.length >= 3 && endpointToken.includes(projectToken);
-    });
-  return dedupeEndpoints([...endpoints, ...healthEndpoints]);
+  // A server health check proves reachability, not ownership of a project Web entry.
+  return dedupeEndpoints([...endpoints, ...sUiPanelEndpoints(project, server, services)]);
 }
 
 function inferredTechnologyStack(project: RemoteInventoryProject, services: RemoteInventoryService[]): string[] {
@@ -697,13 +751,20 @@ export function discoveredProjectsForInventory(server: ServerRecord, inventory: 
   }
 
   const matchedEndpoints = new Set<string>([...projects.values()].flatMap((project) => (project.webEndpoints ?? []).map((endpoint) => endpoint.url)));
+  const matchedHostnames = new Set<string>(
+    [...projects.values()]
+      .flatMap((project) => project.webEndpoints ?? [])
+      .map(endpointHostname)
+      .filter((hostname): hostname is string => Boolean(hostname))
+  );
   const fallbackEndpoints = [
-    ...inventory.webRoutes.flatMap((route) => route.hostnames.map((hostname) => endpointFromRoute(route, hostname))),
-    ...server.healthChecks.map(endpointFromHealthCheck)
+    ...inventory.webRoutes.flatMap((route) => route.hostnames.map((hostname) => endpointFromRoute(route, hostname)))
   ].filter((endpoint): endpoint is ProjectWebEndpoint => Boolean(endpoint));
   for (const endpoint of fallbackEndpoints) {
     const key = endpoint.url;
     if (matchedEndpoints.has(key)) continue;
+    const hostname = endpointHostname(endpoint);
+    if (hostname && matchedHostnames.has(hostname)) continue;
     const fallbackProject = projects.get(server.id + ":unassigned");
     const sourceRoute = inventory.webRoutes.find((route) => route.hostnames.some((hostname) => endpoint.url.includes(hostname)));
     if (fallbackProject && sourceRoute) {
@@ -726,12 +787,13 @@ export function discoveredProjectsForInventory(server: ServerRecord, inventory: 
       fallbackProject.technologyStack = inferredTechnologyStack(fallbackRemoteProject, fallbackServices);
       fallbackProject.runbook = runbookFor(server, inventory, fallbackProject.repositoryPath ?? null, fallbackServices, fallbackProject.technologyStack, fallbackProject.webEndpoints);
       matchedEndpoints.add(key);
+      if (hostname) matchedHostnames.add(hostname);
       continue;
     }
-    const hostname = endpoint.label || endpoint.url;
-    projects.set(server.id + ":web:" + hostname, {
-      sourceKey: server.id + ":web:" + hostname,
-      name: (server.name + " · " + hostname).slice(0, 100),
+    const projectName = endpoint.label || endpoint.url;
+    projects.set(server.id + ":web:" + projectName, {
+      sourceKey: server.id + ":web:" + projectName,
+      name: (server.name + " · " + projectName).slice(0, 100),
       description: "从 " + server.name + " 发现的 Web 入口，尚未关联到代码项目或运行服务。",
       repositoryPath: null,
       serverId: server.id,
@@ -741,6 +803,7 @@ export function discoveredProjectsForInventory(server: ServerRecord, inventory: 
       services: []
     });
     matchedEndpoints.add(key);
+    if (hostname) matchedHostnames.add(hostname);
   }
 
   return [...projects.values()].sort((left, right) => left.name.localeCompare(right.name));
@@ -813,8 +876,9 @@ export function parseInventoryOutput(serverId: string, output: string, collected
       continue;
     }
     if (type !== "WEB" || !fields[2] || !fields[3]) continue;
-    const configPath = cleanField(fields[2], 320);
-    const route = routeStates.get(configPath) ?? {
+    const routeKey = cleanField(fields[2], 320);
+    const configPath = routeKey.replace(/#server-\d+$/, "");
+    const route = routeStates.get(routeKey) ?? {
       source: cleanField(fields[1], 40) || "web",
       configPath,
       hostnames: new Set<string>(),
@@ -841,7 +905,7 @@ export function parseInventoryOutput(serverId: string, output: string, collected
     if (proxyPass) route.upstreams.add(proxyPass[1].replace(/;$/, ""));
     const root = /^root\s+(\S+);?$/i.exec(directive);
     if (root) route.roots.add(root[1].replace(/;$/, ""));
-    routeStates.set(configPath, route);
+    routeStates.set(routeKey, route);
   }
 
   const serviceValues = [...services.values()];
@@ -850,6 +914,14 @@ export function parseInventoryOutput(serverId: string, output: string, collected
       service.projectPath = normalizedProjectPath(service.projectPath ?? "") || null;
       service.projectHint = dockerProjectHint(service, serviceValues);
     }
+  }
+  for (const service of serviceValues) {
+    const project = projectFromProcessService(serverId, service);
+    if (!project) continue;
+    const parentProject = [...projects.values()].find((candidate) =>
+      candidate.path && (project.path === candidate.path || project.path.startsWith(candidate.path + "/"))
+    );
+    if (!parentProject) mergeProject(projects, project);
   }
 
   for (const packageInfo of packages) {
