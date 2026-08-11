@@ -1,10 +1,70 @@
 # AI VPS Gateway
 
-[English](./README.md)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/brand-wordmark.png">
+    <img src="./assets/brand-wordmark-dark.png" width="460" alt="AI VPS Gateway">
+  </picture>
+</p>
 
-面向个人本机使用的 VPS 资产管理、健康监测和 MCP 网关。目标是让 Codex 与 Claude Code 经由统一网关安全管理服务器，而不是获得私钥或直接 SSH 权限。
+<p align="center">
+  <strong>面向 AI 运维的本机优先 VPS 控制平面。</strong><br>
+  在一个本地网关中管理服务器、项目、测活、Runbook 和 MCP 访问。
+</p>
 
-## 当前范围
+<p align="center">
+  <a href="./README.md">English</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#mcp">MCP</a> ·
+  <a href="https://github.com/kukuaki/ai-vps-gateway/releases/latest">下载 macOS 版本</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/kukuaki/ai-vps-gateway/releases"><img src="https://img.shields.io/github/v/release/kukuaki/ai-vps-gateway?style=flat-square&label=latest%20release" alt="最新版本"></a>
+  <a href="https://github.com/kukuaki/ai-vps-gateway/blob/main/LICENSE"><img src="https://img.shields.io/github/license/kukuaki/ai-vps-gateway?style=flat-square&color=22c55e" alt="MIT 许可证"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-0f2e2a?style=flat-square" alt="支持 macOS 和 Linux">
+  <img src="https://img.shields.io/badge/MCP-Codex%20%7C%20Claude-22c55e?style=flat-square" alt="支持 Codex 和 Claude MCP">
+</p>
+
+> [!IMPORTANT]
+> AI 客户端不会拿到私钥或不受限制的 SSH 路径。它们只能请求本机网关执行操作，由网关持有 SSH 进程、按 VPS 串行化访问、记录高危操作，并把运行数据保存在仓库之外。
+
+## 能力概览
+
+| 能力 | 提供内容 |
+| --- | --- |
+| **VPS 管理** | 手动登记、首次 SSH 绑定、TCP/SSH/HTTP(S) 测活、维护和归档状态。 |
+| **项目运维** | 服务盘点、技术栈、端口、Web 入口、部署说明和持久化 Runbook。 |
+| **AI 接入** | 面向 Codex 与 Claude Code 的本机 stdio MCP；同一 VPS 同时只允许一个活动会话，后续请求排队。 |
+| **可观测性** | 当前性能快照、30 天历史、趋势图、阈值告警和审计事件。 |
+
+## 快速开始
+
+### macOS 桌面版
+
+下载 [最新 Apple Silicon 版本](https://github.com/kukuaki/ai-vps-gateway/releases/latest)，打开 DMG 并启动 **AI VPS Gateway**。应用会一起启动本机 API、WebUI 和 MCP 支持；窗口隐藏后仍可从 macOS 菜单栏调出。
+
+### 从源码运行
+
+```bash
+npm install
+npm run dev
+```
+
+打开 `http://127.0.0.1:5173`。打包或分发前，建议依次运行 `npm run typecheck`、`npm test` 和 `npm run build`。
+
+## 架构
+
+```mermaid
+flowchart LR
+  ai["Codex / Claude Code"] -->|stdio MCP| gateway["AI VPS Gateway"]
+  gateway --> ui["本机 WebUI<br/>127.0.0.1:4318"]
+  gateway --> probes["SSH / TCP / HTTP 测活"]
+  probes --> vps["VPS 集群"]
+  gateway --> data["本机 SQLite<br/>仓库之外"]
+```
+
+## 核心能力
 
 - 手动新增、编辑、维护和归档 VPS，新增资产带有首次 SSH 绑定向导，数据保存在本机 SQLite。
 - 从现有 `all-vps` 文档同步 VPS 清单与已知域名健康检查。
@@ -151,7 +211,7 @@ npm run import:all-vps-credentials
 {
   "mcpServers": {
     "ai-vps-gateway": {
-      "command": "/Users/kukuaki/Desktop/AI VPS Gateway.app/Contents/MacOS/AI VPS Gateway",
+      "command": "/path/to/AI VPS Gateway.app/Contents/MacOS/AI VPS Gateway",
       "args": ["--mcp"]
     }
   }
@@ -172,15 +232,16 @@ WebUI 的“复制删除项目提示词”会经过两次确认。提示词要�
 
 “复制删除 VPS 提示词”同样需要两次确认。`delete_server` 只允许在没有项目关联、没有活动或排队会话时删除本机 VPS 记录；它不会删除远程主机。完整盘点会把过期的自动归档记录解除实时关联但保留历史；仍存在的归档项目或手动项目关联依然会阻止删除。
 
-在当前这个仓库中，先启动本机 API/WebUI，再分别注册 MCP：
+从源码运行时，先启动本机 API/WebUI，再分别注册 MCP：
 
 ```bash
-npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run dev
+PROJECT_DIR="/path/to/ai-vps-gateway"
+npm --prefix "$PROJECT_DIR" run dev
 
-codex mcp add ai-vps-gateway -- npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run mcp
+codex mcp add ai-vps-gateway -- npm --prefix "$PROJECT_DIR" run mcp
 codex mcp get ai-vps-gateway
 
-claude mcp add --scope user ai-vps-gateway -- npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run mcp
+claude mcp add --scope user ai-vps-gateway -- npm --prefix "$PROJECT_DIR" run mcp
 claude mcp get ai-vps-gateway
 ```
 

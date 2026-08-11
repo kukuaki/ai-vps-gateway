@@ -1,10 +1,70 @@
 # AI VPS Gateway
 
-[中文文档](./README.zh-CN.md)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/brand-wordmark.png">
+    <img src="./assets/brand-wordmark-dark.png" width="460" alt="AI VPS Gateway">
+  </picture>
+</p>
 
-Local-first VPS inventory, health monitoring, and MCP gateway for personal AI-assisted operations.
+<p align="center">
+  <strong>Local-first control plane for AI-assisted VPS operations.</strong><br>
+  Manage servers, projects, health checks, runbooks, and MCP access from one local gateway.
+</p>
 
-## Current scope
+<p align="center">
+  <a href="./README.zh-CN.md">中文文档</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#mcp">MCP</a> ·
+  <a href="https://github.com/kukuaki/ai-vps-gateway/releases/latest">macOS release</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/kukuaki/ai-vps-gateway/releases"><img src="https://img.shields.io/github/v/release/kukuaki/ai-vps-gateway?style=flat-square&label=latest%20release" alt="Latest release"></a>
+  <a href="https://github.com/kukuaki/ai-vps-gateway/blob/main/LICENSE"><img src="https://img.shields.io/github/license/kukuaki/ai-vps-gateway?style=flat-square&color=22c55e" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-0f2e2a?style=flat-square" alt="macOS and Linux">
+  <img src="https://img.shields.io/badge/MCP-Codex%20%7C%20Claude-22c55e?style=flat-square" alt="Codex and Claude MCP support">
+</p>
+
+> [!IMPORTANT]
+> AI clients never receive private keys or an unrestricted SSH path. They request work from this loopback-only gateway, which owns the SSH process, serializes access per VPS, records high-risk actions, and keeps runtime data outside the repository.
+
+## At a glance
+
+| Capability | What it provides |
+| --- | --- |
+| **VPS control** | Manual assets, first-run SSH binding, TCP/SSH/HTTP(S) liveness, maintenance and archive states. |
+| **Project operations** | Service inventory, technology stacks, ports, Web endpoints, deployment notes and persistent Runbooks. |
+| **AI access** | Local stdio MCP tools for Codex and Claude Code, with one active session per VPS and queueing for later requests. |
+| **Observability** | Current snapshots, 30-day metric history, trend charts, threshold alerts and audit events. |
+
+## Quick start
+
+### macOS desktop
+
+Download the [latest Apple Silicon release](https://github.com/kukuaki/ai-vps-gateway/releases/latest), open the DMG, and launch **AI VPS Gateway**. The app starts the local API, WebUI and MCP support together, then remains available from the macOS menubar when the window is hidden.
+
+### From source
+
+```bash
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. Run `npm run typecheck`, `npm test`, and `npm run build` before packaging or distributing a build.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  ai["Codex / Claude Code"] -->|stdio MCP| gateway["AI VPS Gateway"]
+  gateway --> ui["Local WebUI<br/>127.0.0.1:4318"]
+  gateway --> probes["SSH / TCP / HTTP probes"]
+  probes --> vps["VPS fleet"]
+  gateway --> data["Local SQLite<br/>outside repository"]
+```
+
+## What it does
 
 - Manual VPS inventory with local SQLite persistence and guided first-run SSH binding for newly added VPS assets.
 - Synchronize VPS inventory and documented domain health checks from an existing `all-vps` directory.
@@ -151,7 +211,7 @@ With the macOS desktop client, the AI client does not need to start Node/npm. Op
 {
   "mcpServers": {
     "ai-vps-gateway": {
-      "command": "/Users/kukuaki/Desktop/AI VPS Gateway.app/Contents/MacOS/AI VPS Gateway",
+      "command": "/path/to/AI VPS Gateway.app/Contents/MacOS/AI VPS Gateway",
       "args": ["--mcp"]
     }
   }
@@ -172,15 +232,16 @@ The WebUI requires two confirmations before copying either deletion prompt. The 
 
 The VPS deletion prompt also requires two confirmations. `delete_server` removes a local VPS record only when it has no project links and no active or queued sessions; it never deletes the remote host. A complete inventory pass detaches stale archived automatic records from live associations but retains them for history; any remaining archived or manual link still blocks deletion.
 
-For this checkout, start the local API/WebUI and register the stdio server with the clients:
+For a source checkout, start the local API/WebUI and register the stdio server with the clients:
 
 ```bash
-npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run dev
+PROJECT_DIR="/path/to/ai-vps-gateway"
+npm --prefix "$PROJECT_DIR" run dev
 
-codex mcp add ai-vps-gateway -- npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run mcp
+codex mcp add ai-vps-gateway -- npm --prefix "$PROJECT_DIR" run mcp
 codex mcp get ai-vps-gateway
 
-claude mcp add --scope user ai-vps-gateway -- npm --prefix /Users/kukuaki/Desktop/ai-vps-gateway run mcp
+claude mcp add --scope user ai-vps-gateway -- npm --prefix "$PROJECT_DIR" run mcp
 claude mcp get ai-vps-gateway
 ```
 
