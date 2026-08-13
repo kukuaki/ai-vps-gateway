@@ -1,6 +1,10 @@
 import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import { gatewayApiToken, localGatewayBaseUrl } from "./server/auth.js";
+
+const apiToken = gatewayApiToken();
+const apiBaseUrl = localGatewayBaseUrl();
 
 export default defineConfig({
   plugins: [vue()],
@@ -13,7 +17,12 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      "/api": "http://127.0.0.1:4318"
+      "/api": {
+        target: apiBaseUrl,
+        configure(proxy) {
+          proxy.on("proxyReq", (request) => request.setHeader("x-ai-vps-gateway-token", apiToken));
+        }
+      }
     }
   }
 });

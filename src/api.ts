@@ -22,6 +22,13 @@ interface ApiErrorPayload {
   message?: string;
 }
 
+const sessionCapabilities = new Map<string, string>();
+
+function sessionHeaders(sessionId: string | undefined): Record<string, string> {
+  const token = sessionId ? sessionCapabilities.get(sessionId) : undefined;
+  return token ? { "x-ai-vps-session-token": token } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = {
     ...(init?.body === undefined ? {} : { "content-type": "application/json" }),
@@ -55,13 +62,22 @@ export const api = {
   archiveServer: (id: string) => request<{ archived: boolean }>(`/api/servers/${id}/archive`, { method: "POST" }),
   deleteServer: (id: string) => request<{ deleted: true; serverId: string; credentialRemoved: boolean }>(`/api/servers/${id}/delete`, { method: "POST", body: JSON.stringify({ confirmed: true }) }),
   sessions: () => request<{ sessions: SessionRecord[] }>("/api/sessions"),
-  openSession: (serverId: string, requester = "webui") => request<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: JSON.stringify({ serverId, requester }) }),
-  session: (id: string) => request<{ session: SessionDetail }>(`/api/sessions/${id}`),
-  runCommand: (id: string, command: string, timeoutMs?: number) => request<{ result: unknown; session: SessionDetail | null }>(`/api/sessions/${id}/commands`, { method: "POST", body: JSON.stringify({ command, timeoutMs }) }),
-  closeSession: (id: string, reason = "closed_from_webui") => request<{ session: SessionRecord; promoted: SessionRecord | null }>(`/api/sessions/${id}/close`, { method: "POST", body: JSON.stringify({ reason }) }),
-  collectMetrics: (serverId: string, sessionId?: string) => request<{ metric: ServerDetail["metric"] }>(`/api/servers/${serverId}/metrics`, { method: "POST", body: JSON.stringify({ sessionId }) }),
+  openSession: async (serverId: string, requester = "webui"): Promise<{ session: SessionRecord }> => {
+    const result = await request<{ session: SessionRecord; capabilityToken: string }>("/api/sessions", { method: "POST", body: JSON.stringify({ serverId, requester }) });
+    sessionCapabilities.set(result.session.id, result.capabilityToken);
+    return { session: result.session };
+  },
+  ownsSession: (id: string) => sessionCapabilities.has(id),
+  session: (id: string) => request<{ session: SessionDetail }>(`/api/sessions/${id}`, { headers: sessionHeaders(id) }),
+  runCommand: (id: string, command: string, timeoutMs?: number) => request<{ result: unknown; session: SessionDetail | null }>(`/api/sessions/${id}/commands`, { method: "POST", headers: sessionHeaders(id), body: JSON.stringify({ command, timeoutMs }) }),
+  closeSession: async (id: string, reason = "closed_from_webui"): Promise<{ session: SessionRecord; promoted: SessionRecord | null }> => {
+    const result = await request<{ session: SessionRecord; promoted: SessionRecord | null }>(`/api/sessions/${id}/close`, { method: "POST", headers: sessionHeaders(id), body: JSON.stringify({ reason }) });
+    sessionCapabilities.delete(id);
+    return result;
+  },
+  collectMetrics: (serverId: string, sessionId?: string) => request<{ metric: ServerDetail["metric"] }>(`/api/servers/${serverId}/metrics`, { method: "POST", headers: sessionHeaders(sessionId), body: JSON.stringify({ sessionId }) }),
   collectAllMetrics: () => request<AllMetricsResponse>("/api/metrics/all", { method: "POST" }),
-  syncServerProjects: (serverId: string, sessionId?: string) => request<ServerProjectSyncResult>(`/api/servers/${serverId}/inventory/sync-projects`, { method: "POST", body: JSON.stringify({ sessionId }) }),
+  syncServerProjects: (serverId: string, sessionId?: string) => request<ServerProjectSyncResult>(`/api/servers/${serverId}/inventory/sync-projects`, { method: "POST", headers: sessionHeaders(sessionId), body: JSON.stringify({ sessionId }) }),
   syncAllVpsProjects: () => request<AllVpsProjectSyncResponse>("/api/inventory/all-vps/sync-projects", { method: "POST" }),
   projects: () => request<{ projects: ProjectRecord[] }>("/api/projects"),
   project: (id: string) => request<{ project: ProjectDetail }>(`/api/projects/${id}`),

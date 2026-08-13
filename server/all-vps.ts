@@ -118,8 +118,7 @@ function tagsFor(description: string): string[] {
     ["s-ui", "s-ui"],
     ["sing-box", "sing-box"],
     ["竞赛", "contest"],
-    ["支付", "payment"],
-    ["zongde", "zongde"]
+    ["支付", "payment"]
   ];
   for (const [needle, tag] of terms) {
     if (lower.includes(needle)) tags.push(tag);

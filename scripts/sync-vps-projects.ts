@@ -1,6 +1,13 @@
-const baseUrl = process.env.ALLVPS_API_URL ?? "http://127.0.0.1:4318";
+import { gatewayApiToken, localGatewayBaseUrl, verifyGatewayIdentity } from "../server/auth.js";
 
-const response = await fetch(`${baseUrl}/api/inventory/all-vps/sync-projects`, { method: "POST" });
+const baseUrl = localGatewayBaseUrl();
+const apiToken = gatewayApiToken();
+await verifyGatewayIdentity(baseUrl, apiToken);
+
+const response = await fetch(`${baseUrl}/api/inventory/all-vps/sync-projects`, {
+  method: "POST",
+  headers: { "x-ai-vps-gateway-token": apiToken }
+});
 const payload = (await response.json().catch(() => ({}))) as {
   message?: string;
   summary?: { total: number; success: number; failed: number; created: number; updated: number };

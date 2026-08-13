@@ -209,7 +209,7 @@ PY
   fi
 done
 
-for root in /etc/nginx /etc/zhongde/nginx; do
+for root in /etc/nginx /etc/*/nginx; do
   [ -d "$root" ] || continue
   find -L "$root" -maxdepth 5 \
     \( -path "$root/sites-available" -o -path "$root/sites-available/*" \) -prune -o \
@@ -268,7 +268,7 @@ function uniqueNumbers(values: number[]): number[] {
 }
 
 function normalizedProjectName(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "").replaceAll("zhongde", "zongde");
+  return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "");
 }
 
 function normalizedProjectPath(path: string): string {
@@ -279,8 +279,6 @@ function normalizedProjectPath(path: string): string {
 }
 
 function projectDisplayName(path: string, fallback: string): string {
-  const token = normalizedProjectName(path + " " + fallback);
-  if (token.includes("zongde") || token.includes("zhongde")) return "zongde";
   if (/(?:^|[^a-z])(?:s-ui|x-ui|sui)(?:$|[^a-z])/i.test(path + " " + fallback)) return "S-UI";
   return cleanField(fallback || basename(path) || path, 100);
 }
@@ -350,7 +348,6 @@ function belongsToProject(project: RemoteInventoryProject, service: RemoteInvent
 
 function dockerGroupForService(name: string, image: string | null, allServices: RemoteInventoryService[]): string {
   const value = (name + " " + (image ?? "")).toLowerCase();
-  if (value.includes("zongde") || value.includes("zhongde")) return "zongde";
   if (value.includes("s-ui") || /(?:^|[-_])(?:sui|x-ui)(?:$|[-_])/.test(value)) return "s-ui";
   const cleanName = name.replace(/^\//, "");
   const prefix = cleanName.split(/[-_]/)[0] ?? cleanName;
@@ -584,7 +581,83 @@ function runbookFor(server: ServerRecord, inventory: ServerInventory, projectPat
   };
 }
 
-function routeMatchesProject(project: RemoteInventoryProject, route: RemoteInventoryWebRoute, services: RemoteInventoryService[]): boolean {
+function isNginxService(service: RemoteInventoryService): boolean {
+  return /(?:^|[^a-z])nginx(?:[^a-z]|$)/i.test(service.name + " " + service.identifier);
+}
+
+function isSingBoxService(service: RemoteInventoryService): boolean {
+  return /sing[-_ ]?box/i.test(service.name + " " + service.identifier);
+}
+
+function isNginxRoute(route: RemoteInventoryWebRoute): boolean {
+  return /(?:^|:)nginx(?:$|[:_-])/i.test(route.source);
+}
+
+function isLoopbackUpstream(upstream: string | null): boolean {
+  if (!upstream) return false;
+  try {
+    const hostname = new URL(upstream).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return hostname === "localhost" || hostname === "::1" || hostname.startsWith("127.");
+  } catch {
+    return /^(?:https?:\/\/)?(?:localhost|127(?:\.\d{1,3}){3}|\[?::1\]?)(?::|\/|$)/i.test(upstream);
+  }
+}
+
+function isSingBoxProxyRoute(route: RemoteInventoryWebRoute): boolean {
+  return isNginxRoute(route) && isLoopbackUpstream(route.upstream) && Boolean(route.upstreamPort);
+}
+
+function projectRepresentsSingBox(project: RemoteInventoryProject, services: RemoteInventoryService[]): boolean {
+  if (/sing[-_ ]?box/i.test(project.name + " " + project.manifest)) return true;
+  return services.some((service) => isSingBoxService(service) && belongsToProject(project, service));
+}
+
+function unresolvedServiceGroups(inventory: ServerInventory, services: RemoteInventoryService[]): RemoteInventoryService[][] {
+  const unassignedRouteManagers = services.filter(isNginxService);
+  const applicationGroups = services.filter((service) => !isNginxService(service)).map((service) => [service]);
+  const attachedManagers = new Set<RemoteInventoryService>();
+
+  for (const route of inventory.webRoutes) {
+    if (!route.upstream && !route.serviceName) continue;
+    const routeServices = servicesForRoute(route, inventory.services);
+    const managers = routeServices.filter(isNginxService);
+    const upstreams = routeServices.filter((service) => !isNginxService(service) && services.includes(service));
+    for (const upstream of upstreams) {
+      const group = applicationGroups.find((candidate) => candidate.includes(upstream));
+      if (!group) continue;
+      for (const manager of managers) {
+        if (!group.includes(manager)) group.push(manager);
+        attachedManagers.add(manager);
+      }
+    }
+  }
+
+  const singBoxServices = services.filter(isSingBoxService);
+  if (singBoxServices.length === 1) {
+    const group = applicationGroups.find((candidate) => candidate.includes(singBoxServices[0]!));
+    for (const route of inventory.webRoutes.filter(isSingBoxProxyRoute)) {
+      const routeServices = servicesForRoute(route, inventory.services);
+      const upstreams = routeServices.filter((service) => !isNginxService(service));
+      if (upstreams.length && !upstreams.every(isSingBoxService)) continue;
+      for (const manager of routeServices.filter(isNginxService)) {
+        if (group && !group.includes(manager)) group.push(manager);
+        attachedManagers.add(manager);
+      }
+    }
+  }
+
+  return [
+    ...applicationGroups,
+    ...unassignedRouteManagers.filter((service) => !attachedManagers.has(service)).map((service) => [service])
+  ];
+}
+
+function routeMatchesProject(
+  project: RemoteInventoryProject,
+  route: RemoteInventoryWebRoute,
+  services: RemoteInventoryService[],
+  inventoryServices: RemoteInventoryService[]
+): boolean {
   const projectToken = normalizedProjectName(project.name);
   const hintToken = normalizedProjectName(route.projectHint ?? "");
   const routeToken = normalizedProjectName(route.configPath + " " + (route.upstream ?? "") + " " + (route.serviceName ?? ""));
@@ -594,6 +667,11 @@ function routeMatchesProject(project: RemoteInventoryProject, route: RemoteInven
     .filter((value): value is string => Boolean(value))
     .some((value) => value === project.path || value.startsWith(project.path + "/")));
   if (pathMatches) return true;
+  if (isSingBoxProxyRoute(route) && projectRepresentsSingBox(project, services) &&
+    services.some(isNginxService) && services.some(isSingBoxService)) {
+    const identifiedUpstreams = servicesForRoute(route, inventoryServices).filter((service) => !isNginxService(service));
+    if (!identifiedUpstreams.length || identifiedUpstreams.every(isSingBoxService)) return true;
+  }
   return services.some((service) => belongsToProject(project, service) && (
     service.name === route.serviceName ||
     Boolean(route.upstreamPort && serviceListensOnPort(service, route.upstreamPort))
@@ -619,7 +697,7 @@ function servicesForRoute(route: RemoteInventoryWebRoute, services: RemoteInvent
 
 function servicesForProject(project: RemoteInventoryProject, inventory: ServerInventory): RemoteInventoryService[] {
   const result = new Set(inventory.services.filter((service) => belongsToProject(project, service)));
-  const matchingRoutes = inventory.webRoutes.filter((route) => routeMatchesProject(project, route, inventory.services));
+  const matchingRoutes = inventory.webRoutes.filter((route) => routeMatchesProject(project, route, inventory.services, inventory.services));
   for (const route of matchingRoutes) {
     for (const service of servicesForRoute(route, inventory.services)) result.add(service);
   }
@@ -634,7 +712,7 @@ function endpointsForProject(
 ): ProjectWebEndpoint[] {
   const endpoints = [...project.webEndpoints];
   for (const route of inventory.webRoutes) {
-    if (!routeMatchesProject(project, route, services)) continue;
+    if (!routeMatchesProject(project, route, services, inventory.services)) continue;
     for (const hostname of route.hostnames) {
       const endpoint = endpointFromRoute(route, hostname);
       if (endpoint) endpoints.push(endpoint);
@@ -674,6 +752,19 @@ function syntheticDockerProject(serverId: string, group: string, services: Remot
   addStack(project, ["Docker"]);
   if (group === "s-ui") addStack(project, ["S-UI"]);
   return project;
+}
+
+function syntheticServiceProject(serverId: string, services: RemoteInventoryService[]): RemoteInventoryProject {
+  if (!services.length) throw new Error("无法为空服务组生成项目");
+  const service = services.find(isSingBoxService) ?? services.find((item) => !isNginxService(item)) ?? services[0];
+  return {
+    key: serverId + ":service:" + service.manager + ":" + service.identifier,
+    name: service.name,
+    path: "",
+    manifest: service.manager + ":" + service.identifier,
+    technologyStack: [],
+    webEndpoints: []
+  };
 }
 
 export function discoveredProjectsForInventory(server: ServerRecord, inventory: ServerInventory): DiscoveredProjectInput[] {
@@ -726,27 +817,24 @@ export function discoveredProjectsForInventory(server: ServerRecord, inventory: 
   }
 
   const stillUnassigned = inventory.services.filter((service) => !assigned.has(service));
-  if (stillUnassigned.length) {
-    const project: RemoteInventoryProject = {
-      key: server.id + ":unassigned",
-      name: "未归类服务",
-      path: "",
-      manifest: "remote-services",
-      technologyStack: [],
-      webEndpoints: []
-    };
-    const technologyStack = inferredTechnologyStack(project, stillUnassigned);
-    const webEndpoints = endpointsForProject(project, server, inventory, stillUnassigned);
+  for (const servicesForProject of unresolvedServiceGroups(inventory, stillUnassigned)) {
+    const project = syntheticServiceProject(server.id, servicesForProject);
+    const technologyStack = inferredTechnologyStack(project, servicesForProject);
+    const webEndpoints = endpointsForProject(project, server, inventory, servicesForProject);
+    const serviceNames = servicesForProject.map((item) => item.name).join("、");
+    const groupingNote = servicesForProject.length > 1
+      ? "已按 Nginx 反向代理到本地服务的入口链路归并为同一项目。"
+      : "未发现可关联的项目路径，已按服务名称建档。";
     projects.set(project.key, {
       sourceKey: project.key,
-      name: (server.name + " · 未归类服务").slice(0, 100),
-      description: "从 " + server.name + " 只读发现但尚未能关联到项目路径的服务。已保留管理方式、状态和端口，后续可在项目编辑器中重新归属。",
+      name: (server.name + " · " + project.name).slice(0, 100),
+      description: "从 " + server.name + " 只读发现的 " + serviceNames + " 服务。" + groupingNote,
       repositoryPath: null,
       serverId: server.id,
       technologyStack,
       webEndpoints,
-      runbook: runbookFor(server, inventory, null, stillUnassigned, technologyStack, webEndpoints),
-      services: stillUnassigned.map((service) => serviceInput(server, service))
+      runbook: runbookFor(server, inventory, null, servicesForProject, technologyStack, webEndpoints),
+      services: servicesForProject.map((item) => serviceInput(server, item))
     });
   }
 
@@ -765,8 +853,14 @@ export function discoveredProjectsForInventory(server: ServerRecord, inventory: 
     if (matchedEndpoints.has(key)) continue;
     const hostname = endpointHostname(endpoint);
     if (hostname && matchedHostnames.has(hostname)) continue;
-    const fallbackProject = projects.get(server.id + ":unassigned");
     const sourceRoute = inventory.webRoutes.find((route) => route.hostnames.some((hostname) => endpoint.url.includes(hostname)));
+    const routeServices = sourceRoute ? servicesForRoute(sourceRoute, inventory.services) : [];
+    const upstreamServices = routeServices.filter((service) => !isNginxService(service));
+    const fallbackProject = sourceRoute
+      ? [...projects.values()].find((project) => upstreamServices.some((service) =>
+        project.services?.some((item) => item.manager === service.manager && item.identifier === service.identifier)
+      ))
+      : undefined;
     if (fallbackProject && sourceRoute) {
       const knownServices = new Map((fallbackProject.services ?? []).map((service) => [service.manager + ":" + service.identifier, service]));
       for (const service of servicesForRoute(sourceRoute, inventory.services)) {
@@ -931,7 +1025,6 @@ export function parseInventoryOutput(serverId: string, output: string, collected
     const target = projects.get(project.key);
     if (!target) continue;
     addStack(target, inferStack(packageInfo.kind, packageInfo.path, packageInfo.dependencies));
-    if (packageInfo.name && /zongde|zhongde/i.test(packageInfo.name)) target.name = "zongde";
   }
   for (const project of projects.values()) {
     for (const manifest of project.manifest.split(",")) addStack(project, inferStack(manifest.split(":")[0] ?? "", manifest));
@@ -955,9 +1048,7 @@ export function parseInventoryOutput(serverId: string, output: string, collected
     const rootProject = root
       ? [...projects.values()].find((project) => project.path && (root === project.path || root.startsWith(project.path + "/")))
       : undefined;
-    const projectHint = /(?:zongde|zhongde)/i.test(route.configPath)
-      ? "zongde"
-      : service?.projectHint ?? rootProject?.name ?? null;
+    const projectHint = service?.projectHint ?? rootProject?.name ?? null;
     return {
       source: route.source,
       configPath: route.configPath,
@@ -972,7 +1063,7 @@ export function parseInventoryOutput(serverId: string, output: string, collected
   }).filter((route) => route.hostnames.length || route.upstream || route.root);
 
   for (const project of projects.values()) {
-    const matchingRoutes = webRoutes.filter((route) => routeMatchesProject(project, route, serviceValues));
+    const matchingRoutes = webRoutes.filter((route) => routeMatchesProject(project, route, serviceValues, serviceValues));
     project.webEndpoints = dedupeEndpoints(
       matchingRoutes
         .flatMap((route) => route.hostnames.map((hostname) => endpointFromRoute(route, hostname)))

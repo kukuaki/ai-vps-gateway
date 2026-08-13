@@ -5,10 +5,17 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell, Tray } from "electron";
 import type { FastifyInstance } from "fastify";
+import { gatewayApiToken } from "../server/auth.js";
 import { buildApp } from "../server/main.js";
+import {
+  API_ORIGIN,
+  API_PORT,
+  gatewayAlreadyRunning,
+  initialGatewayPageLoadOptions,
+  isTrustedIpcSender,
+  resolveNavigationTarget
+} from "./security.js";
 
-const API_PORT = 4318;
-const API_ORIGIN = `http://127.0.0.1:${API_PORT}`;
 const MCP_CLIENTS = ["codex", "claude"] as const;
 
 type McpClient = (typeof MCP_CLIENTS)[number];
@@ -75,37 +82,20 @@ function mcpCommand(client: McpClient): string {
     : `claude mcp add --scope user ai-vps-gateway -- ${executable} --mcp`;
 }
 
-async function gatewayAlreadyRunning(): Promise<boolean> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1_500);
-  timeout.unref();
-  try {
-    const response = await fetch(`${API_ORIGIN}/api/health`, { signal: controller.signal });
-    const payload = (await response.json().catch(() => null)) as { ok?: boolean; mode?: string } | null;
-    if (!response.ok || payload?.ok !== true || payload.mode !== "local-only") return false;
-    const webResponse = await fetch(`${API_ORIGIN}/`, { signal: controller.signal });
-    return webResponse.ok && (webResponse.headers.get("content-type") ?? "").includes("text/html");
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function startGateway(): Promise<void> {
-  if (await gatewayAlreadyRunning()) {
+async function startGateway(token: string): Promise<void> {
+  if (await gatewayAlreadyRunning(token)) {
     ownsGateway = false;
     return;
   }
 
-  const candidate = await buildApp(undefined, { staticDirectory: desktopPath() });
+  const candidate = await buildApp(undefined, { apiToken: token, staticDirectory: desktopPath() });
   try {
     await candidate.listen({ host: "127.0.0.1", port: API_PORT });
     gateway = candidate;
     ownsGateway = true;
   } catch (error) {
     await candidate.close();
-    if (await gatewayAlreadyRunning()) {
+    if (await gatewayAlreadyRunning(token)) {
       ownsGateway = false;
       return;
     }
@@ -182,7 +172,7 @@ function destroyTray(): void {
   trayMenu = null;
 }
 
-function createWindow(): void {
+function createWindow(token: string): void {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -208,15 +198,27 @@ function createWindow(): void {
     mainWindow = null;
   });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+    const target = resolveNavigationTarget(url);
+    if (target.action === "internal") {
+      void mainWindow?.loadURL(target.url);
+    } else if (target.action === "external") {
+      void shell.openExternal(target.url);
+    }
     return { action: "deny" };
   });
   mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (url.startsWith(API_ORIGIN)) return;
+    const target = resolveNavigationTarget(url);
+    if (target.action === "internal") return;
     event.preventDefault();
-    if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+    if (target.action === "external") void shell.openExternal(target.url);
   });
-  void mainWindow.loadURL(`${API_ORIGIN}/`);
+  mainWindow.webContents.on("will-redirect", (event, url) => {
+    const target = resolveNavigationTarget(url);
+    if (target.action === "internal") return;
+    event.preventDefault();
+    if (target.action === "external") void shell.openExternal(target.url);
+  });
+  void mainWindow.loadURL(`${API_ORIGIN}/`, initialGatewayPageLoadOptions(token));
 }
 
 function runCli(command: string, args: string[]): Promise<CliResult> {
@@ -254,15 +256,19 @@ function runCli(command: string, args: string[]): Promise<CliResult> {
 }
 
 function registerIpc(): void {
-  ipcMain.handle("desktop:get-status", () => ({
-    apiUrl: API_ORIGIN,
-    managedByDesktop: ownsGateway,
-    packaged: app.isPackaged,
-    codexCommand: mcpCommand("codex"),
-    claudeCommand: mcpCommand("claude")
-  }));
+  ipcMain.handle("desktop:get-status", (event) => {
+    if (!isTrustedIpcSender(event)) throw new Error("拒绝来自非网关页面的 IPC 调用");
+    return {
+      apiUrl: API_ORIGIN,
+      managedByDesktop: ownsGateway,
+      packaged: app.isPackaged,
+      codexCommand: mcpCommand("codex"),
+      claudeCommand: mcpCommand("claude")
+    };
+  });
 
-  ipcMain.handle("desktop:install-mcp", async (_event, client: unknown): Promise<CliResult> => {
+  ipcMain.handle("desktop:install-mcp", async (event, client: unknown): Promise<CliResult> => {
+    if (!isTrustedIpcSender(event)) throw new Error("拒绝来自非网关页面的 IPC 调用");
     if (!MCP_CLIENTS.includes(client as McpClient)) {
       return { ok: false, message: "未知 MCP 客户端" };
     }
@@ -297,9 +303,15 @@ async function bootstrapDesktop(): Promise<void> {
   await app.whenReady();
   registerIpc();
   try {
-    await startGateway();
-    createWindow();
+    const token = gatewayApiToken();
+    await startGateway(token);
+    createWindow(token);
     createTray();
+
+    app.on("activate", () => {
+      if (!mainWindow) createWindow(token);
+      showDashboard();
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     dialog.showErrorBox("AI VPS Gateway 无法启动", `本机端口 ${API_PORT} 无法提供网关服务。\n\n${message}`);
@@ -307,10 +319,6 @@ async function bootstrapDesktop(): Promise<void> {
     return;
   }
 
-  app.on("activate", () => {
-    if (!mainWindow) createWindow();
-    showDashboard();
-  });
   app.on("window-all-closed", () => {
     // The gateway remains available from the menubar while its window is hidden.
   });

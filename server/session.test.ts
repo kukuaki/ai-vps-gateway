@@ -18,8 +18,8 @@ describe("session leases", () => {
     const database = new GatewayDatabase(directory);
     const server = database.createServer({ name: "租约节点", address: "203.0.113.40", sshPort: 22, sshUser: "root" });
 
-    const first = database.openSession(server.id, "codex", 60_000, 600_000);
-    const second = database.openSession(server.id, "claude", 60_000, 600_000);
+    const first = database.openSession(server.id, "codex", "first-hash", 60_000, 600_000);
+    const second = database.openSession(server.id, "claude", "second-hash", 60_000, 600_000);
     assert.equal(first?.status, "active");
     assert.equal(second?.status, "queued");
     assert.equal(second?.queuePosition, 1);
@@ -37,8 +37,8 @@ describe("session leases", () => {
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);
     const server = database.createServer({ name: "过期节点", address: "203.0.113.41", sshPort: 22, sshUser: "root" });
-    const first = database.openSession(server.id, "codex", 50, 600_000);
-    const second = database.openSession(server.id, "claude", 60_000, 600_000);
+    const first = database.openSession(server.id, "codex", "first-hash", 50, 600_000);
+    const second = database.openSession(server.id, "claude", "second-hash", 60_000, 600_000);
     assert.equal(first?.status, "active");
     assert.equal(second?.status, "queued");
 

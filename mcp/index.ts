@@ -1,13 +1,24 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { gatewayApiToken, localGatewayBaseUrl, verifyGatewayIdentity } from "../server/auth.js";
 
-const apiBaseUrl = process.env.ALLVPS_API_URL ?? "http://127.0.0.1:4318";
+const apiBaseUrl = localGatewayBaseUrl();
+const apiToken = gatewayApiToken();
+const sessionCapabilities = new Map<string, string>();
+const MCP_PRIVATE_FIELDS = new Set(["credentialRef", "capabilityToken", "capabilityHash"]);
 
-async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
+async function apiRequest<T>(path: string, init?: RequestInit, sessionId?: string): Promise<T> {
+  await verifyGatewayIdentity(apiBaseUrl, apiToken);
+  const sessionCapability = sessionId ? sessionCapabilities.get(sessionId) : undefined;
   const response = await fetch(`${apiBaseUrl}${path}`, {
     ...init,
-    headers: { "content-type": "application/json", ...(init?.headers ?? {}) }
+    headers: {
+      "content-type": "application/json",
+      "x-ai-vps-gateway-token": apiToken,
+      ...(sessionCapability ? { "x-ai-vps-session-token": sessionCapability } : {}),
+      ...(init?.headers ?? {})
+    }
   });
   const payload = (await response.json().catch(() => ({}))) as { message?: string };
   if (!response.ok) {
@@ -16,20 +27,28 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
-async function apiGet<T>(path: string): Promise<T> {
-  return apiRequest<T>(path);
+async function apiGet<T>(path: string, sessionId?: string): Promise<T> {
+  return apiRequest<T>(path, undefined, sessionId);
 }
 
-async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  return apiRequest<T>(path, { method: "POST", body: JSON.stringify(body) });
+async function apiPost<T>(path: string, body: unknown, sessionId?: string): Promise<T> {
+  return apiRequest<T>(path, { method: "POST", body: JSON.stringify(body) }, sessionId);
 }
 
 async function apiPatch<T>(path: string, body: unknown): Promise<T> {
   return apiRequest<T>(path, { method: "PATCH", body: JSON.stringify(body) });
 }
 
+function sanitizeMcpResult(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeMcpResult);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, entry]) => MCP_PRIVATE_FIELDS.has(key) ? [] : [[key, sanitizeMcpResult(entry)]])
+  );
+}
+
 function jsonResult(value: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
+  return { content: [{ type: "text" as const, text: JSON.stringify(sanitizeMcpResult(value), null, 2) }] };
 }
 
 function errorResult(error: unknown) {
@@ -39,7 +58,7 @@ function errorResult(error: unknown) {
   };
 }
 
-const server = new McpServer({ name: "ai-vps-gateway", version: "0.1.0" });
+const server = new McpServer({ name: "ai-vps-gateway", version: "0.1.1" });
 
 const projectRunbookInput = z.object({
   overview: z.string().trim().max(12_000).default(""),
@@ -152,7 +171,9 @@ server.registerTool(
   },
   async ({ serverId, requester }) => {
     try {
-      return jsonResult(await apiPost("/api/sessions", { serverId, requester }));
+      const result = await apiPost<{ session: { id: string }; capabilityToken: string }>("/api/sessions", { serverId, requester });
+      sessionCapabilities.set(result.session.id, result.capabilityToken);
+      return jsonResult({ session: result.session });
     } catch (error) {
       return errorResult(error);
     }
@@ -169,7 +190,7 @@ server.registerTool(
   },
   async ({ sessionId }) => {
     try {
-      return jsonResult(await apiGet(`/api/sessions/${sessionId}`));
+      return jsonResult(await apiGet(`/api/sessions/${sessionId}`, sessionId));
     } catch (error) {
       return errorResult(error);
     }
@@ -189,7 +210,7 @@ server.registerTool(
   },
   async ({ sessionId, command, timeoutMs }) => {
     try {
-      return jsonResult(await apiPost(`/api/sessions/${sessionId}/commands`, { command, timeoutMs }));
+      return jsonResult(await apiPost(`/api/sessions/${sessionId}/commands`, { command, timeoutMs }, sessionId));
     } catch (error) {
       return errorResult(error);
     }
@@ -208,7 +229,9 @@ server.registerTool(
   },
   async ({ sessionId, reason }) => {
     try {
-      return jsonResult(await apiPost(`/api/sessions/${sessionId}/close`, { reason }));
+      const result = await apiPost(`/api/sessions/${sessionId}/close`, { reason }, sessionId);
+      sessionCapabilities.delete(sessionId);
+      return jsonResult(result);
     } catch (error) {
       return errorResult(error);
     }
@@ -227,7 +250,7 @@ server.registerTool(
   },
   async ({ serverId, sessionId }) => {
     try {
-      return jsonResult(await apiPost(`/api/servers/${serverId}/metrics`, { sessionId }));
+      return jsonResult(await apiPost(`/api/servers/${serverId}/metrics`, { sessionId }, sessionId));
     } catch (error) {
       return errorResult(error);
     }
@@ -303,7 +326,7 @@ server.registerTool(
   },
   async ({ serverId, sessionId }) => {
     try {
-      return jsonResult(await apiPost(`/api/servers/${serverId}/inventory/sync-projects`, { sessionId }));
+      return jsonResult(await apiPost(`/api/servers/${serverId}/inventory/sync-projects`, { sessionId }, sessionId));
     } catch (error) {
       return errorResult(error);
     }

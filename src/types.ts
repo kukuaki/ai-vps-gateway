@@ -95,6 +95,7 @@ export interface SessionRecord {
   closeReason: string | null;
   queuePosition: number;
   activeSessionId: string | null;
+  operationInFlight: boolean;
 }
 
 export interface CommandRunRecord {

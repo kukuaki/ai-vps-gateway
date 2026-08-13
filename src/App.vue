@@ -225,6 +225,7 @@ const selectedServerSession = computed(() => {
   const serverId = selectedServer.value?.id;
   return serverId ? sessions.value.find((session) => session.serverId === serverId) ?? null : null;
 });
+const selectedServerSessionOwned = computed(() => Boolean(selectedServerSession.value && api.ownsSession(selectedServerSession.value.id)));
 const isEditing = computed(() => editingId.value !== null);
 const isProjectEditing = computed(() => editingProjectId.value !== null);
 
@@ -691,7 +692,7 @@ async function refresh(selectId?: string): Promise<void> {
     const existingSession = selectedSession.value;
     const sessionId = existingSession && existingSession.serverId === targetId
       ? existingSession.id
-      : sessions.value.find((session) => session.serverId === targetId)?.id;
+      : sessions.value.find((session) => session.serverId === targetId && api.ownsSession(session.id))?.id;
     selectedSession.value = sessionId ? await api.session(sessionId).then((result) => result.session).catch(() => null) : null;
     const projectId = selectedProject.value?.id;
     if (projectId) selectedProject.value = await api.project(projectId).then((result) => result.project).catch(() => null);
@@ -716,7 +717,7 @@ async function openServer(server: ServerRecord): Promise<void> {
     const [detail, history] = await Promise.all([api.server(server.id), api.metricHistory(server.id, 48, metricHistoryHours.value).catch(() => ({ metrics: [] }))]);
     selected.value = detail;
     metricHistory.value = history.metrics;
-    const session = sessions.value.find((item) => item.serverId === server.id);
+    const session = sessions.value.find((item) => item.serverId === server.id && api.ownsSession(item.id));
     selectedSession.value = session ? await api.session(session.id).then((result) => result.session).catch(() => null) : null;
     activeView.value = "servers";
   } catch (error) {
@@ -740,7 +741,10 @@ async function openAiSession(server: ServerRecord): Promise<void> {
 
 async function closeAiSession(): Promise<void> {
   const sessionId = selectedServerSession.value?.id;
-  if (!sessionId) return;
+  if (!sessionId || !api.ownsSession(sessionId)) {
+    errorMessage.value = "该会话由其他 Agent 持有，WebUI 不能借用或释放";
+    return;
+  }
   isSessionAction.value = true;
   errorMessage.value = null;
   try {
@@ -786,7 +790,7 @@ async function collectMetrics(server: ServerRecord): Promise<void> {
   isCollectingMetrics.value = true;
   errorMessage.value = null;
   try {
-    const sessionId = selectedServerSession.value?.status === "active" ? selectedServerSession.value.id : undefined;
+    const sessionId = selectedServerSession.value?.status === "active" && api.ownsSession(selectedServerSession.value.id) ? selectedServerSession.value.id : undefined;
     await api.collectMetrics(server.id, sessionId);
     const [detail, history] = await Promise.all([api.server(server.id), api.metricHistory(server.id, 48, metricHistoryHours.value).catch(() => ({ metrics: [] }))]);
     selected.value = detail;
@@ -828,7 +832,7 @@ async function syncServerProjects(server: ServerRecord): Promise<void> {
   isProjectSyncing.value = true;
   errorMessage.value = null;
   try {
-    const sessionId = selectedServerSession.value?.status === "active" ? selectedServerSession.value.id : undefined;
+    const sessionId = selectedServerSession.value?.status === "active" && api.ownsSession(selectedServerSession.value.id) ? selectedServerSession.value.id : undefined;
     const result = await api.syncServerProjects(server.id, sessionId);
     await refresh(server.id);
     notify(`${server.name} 项目已同步：新增 ${result.projects.filter((project) => project.action === "created").length}，更新 ${result.projects.filter((project) => project.action === "updated").length}，归档 ${result.archived}`);
@@ -1355,7 +1359,7 @@ onUnmounted(() => {
     <div v-if="showEditor" class="modal-backdrop" @mousedown.self="showEditor = false">
       <form class="editor-modal" @submit.prevent="saveServer">
         <header><div><p class="eyebrow">{{ isEditing ? '编辑资产' : '手动登记' }}</p><h2>{{ isEditing ? '更新 VPS' : '添加 VPS' }}</h2></div><button class="icon-button" type="button" title="关闭" @click="showEditor = false"><X :size="18" /></button></header>
-        <div class="form-grid"><label class="full"><span>显示名称</span><input v-model="form.name" required maxlength="80" placeholder="例如：大阪主站" /></label><label><span>地址</span><input v-model="form.address" required maxlength="253" placeholder="IP 或主机名" /></label><label><span>SSH 端口</span><input v-model.number="form.sshPort" required type="number" min="1" max="65535" /></label><label><span>SSH 用户</span><input v-model="form.sshUser" required maxlength="80" placeholder="root 或 ubuntu" /></label><label><span>SSH 网络路径</span><select v-model="form.networkMode"><option value="system">系统路由</option><option value="direct">直连物理网卡（绕过 TUN）</option></select></label><label><span>环境</span><input v-model="form.environment" required maxlength="40" placeholder="production" /></label><label class="full"><span>用途 / 角色</span><input v-model="form.role" maxlength="100" placeholder="例如：Web、数据库、代理节点" /></label><div v-if="!isEditing" class="form-help full"><KeyRound :size="16" /><span><strong>SSH 密钥会在保存后自动生成</strong><small>无需填写私钥。下一步只需在 VPS 的云厂商网页终端或现有登录方式中粘贴一次公钥安装命令。</small></span></div><div v-else class="form-help full"><KeyRound :size="16" /><span><strong>{{ form.credentialRef ? '网关 SSH 凭据已关联' : '尚未完成网关 SSH 绑定' }}</strong><small>私钥不会显示或写入项目目录；需要首次绑定时请在 VPS 详情中点击“绑定 SSH”。</small></span></div><label class="full"><span>标签</span><input v-model="form.tags" maxlength="200" placeholder="逗号分隔，例如：docker, asia" /></label></div>
+        <div class="form-grid"><label class="full"><span>显示名称</span><input v-model="form.name" required maxlength="80" placeholder="例如：应用节点" /></label><label><span>地址</span><input v-model="form.address" required maxlength="253" placeholder="IP 或主机名" /></label><label><span>SSH 端口</span><input v-model.number="form.sshPort" required type="number" min="1" max="65535" /></label><label><span>SSH 用户</span><input v-model="form.sshUser" required maxlength="80" placeholder="root 或 ubuntu" /></label><label><span>SSH 网络路径</span><select v-model="form.networkMode"><option value="system">系统路由</option><option value="direct">直连物理网卡（绕过 TUN）</option></select></label><label><span>环境</span><input v-model="form.environment" required maxlength="40" placeholder="production" /></label><label class="full"><span>用途 / 角色</span><input v-model="form.role" maxlength="100" placeholder="例如：Web、数据库、代理节点" /></label><div v-if="!isEditing" class="form-help full"><KeyRound :size="16" /><span><strong>SSH 密钥会在保存后自动生成</strong><small>无需填写私钥。下一步只需在 VPS 的云厂商网页终端或现有登录方式中粘贴一次公钥安装命令。</small></span></div><div v-else class="form-help full"><KeyRound :size="16" /><span><strong>{{ form.credentialRef ? '网关 SSH 凭据已关联' : '尚未完成网关 SSH 绑定' }}</strong><small>私钥不会显示或写入项目目录；需要首次绑定时请在 VPS 详情中点击“绑定 SSH”。</small></span></div><label class="full"><span>标签</span><input v-model="form.tags" maxlength="200" placeholder="逗号分隔，例如：docker, asia" /></label></div>
         <label class="switch-row"><input v-model="form.addHttpCheck" type="checkbox" /><span><strong>附加 HTTP 健康检查</strong><small>按指定状态码判断，不将 Ping 作为前提。</small></span></label>
         <div v-if="form.addHttpCheck" class="form-grid check-fields"><label class="full"><span>健康检查 URL</span><input v-model="form.healthUrl" required type="url" placeholder="https://example.com/health" /></label><label><span>预期状态码</span><input v-model="form.expectedStatusCodes" required placeholder="200, 301, 404" /></label><label><span>检查网络路径</span><select v-model="form.healthCheckNetworkMode"><option value="system">系统路由（域名公开可用性）</option><option value="direct">直连物理网卡（源站检查）</option></select></label></div>
         <label class="switch-row"><input v-model="form.maintenance" type="checkbox" /><span><strong>维护模式</strong><small>保留资产，但探针显示为维护中。</small></span></label>
@@ -1408,7 +1412,7 @@ onUnmounted(() => {
       <form class="editor-modal project-editor-modal" @submit.prevent="saveProject">
         <header><div><p class="eyebrow">项目档案</p><h2>{{ isProjectEditing ? '编辑项目' : '创建项目' }}</h2></div><button class="icon-button" type="button" title="关闭" @click="showProjectEditor = false"><X :size="18" /></button></header>
         <div class="form-grid"><label class="full"><span>项目名称</span><input v-model="projectForm.name" required maxlength="100" placeholder="例如：竞赛文件平台" /></label><label class="full"><span>项目描述</span><input v-model="projectForm.description" maxlength="2_000" placeholder="一句话说明项目用途和当前状态" /></label><label><span>代码仓库</span><input v-model="projectForm.repositoryUrl" type="url" placeholder="https://github.com/..." /></label><label><span>本机项目路径</span><input v-model="projectForm.repositoryPath" maxlength="320" placeholder="仅保存路径引用" /></label><label class="full"><span>技术栈</span><input v-model="projectForm.technologyStack" maxlength="4_000" placeholder="逗号分隔，例如 Next.js, React, PostgreSQL" /></label></div>
-<section class="modal-section"><div class="modal-section-heading"><div><h3>项目 Web 入口</h3><p>可填多个；没有网站的项目留空。地址属于项目，不属于 VPS。</p></div><button class="text-button" type="button" @click="addProjectEndpoint"><Plus :size="15" /> 添加入口</button></div><div v-if="projectForm.webEndpoints.length" class="endpoint-editor-list"><div v-for="(endpoint, index) in projectForm.webEndpoints" :key="index" class="endpoint-editor-row"><div class="endpoint-editor-grid"><label><span>显示名称</span><input v-model="endpoint.label" maxlength="120" placeholder="例如：主站" /></label><label><span>URL</span><input v-model="endpoint.url" required type="url" placeholder="https://example.com" /></label><label><span>端口</span><input v-model="endpoint.port" type="number" min="1" max="65535" placeholder="443" /></label><label><span>对应服务</span><input v-model="endpoint.serviceName" maxlength="100" placeholder="例如：zongde-nginx" /></label><label class="full"><span>备注</span><input v-model="endpoint.notes" maxlength="1000" placeholder="入口用途、反代上游或特殊说明" /></label></div><button class="mini-icon service-remove" type="button" title="移除入口" @click="removeProjectEndpoint(index)"><X :size="15" /></button></div></div><div v-else class="empty-inline">项目暂无 Web 入口</div></section>
+<section class="modal-section"><div class="modal-section-heading"><div><h3>项目 Web 入口</h3><p>可填多个；没有网站的项目留空。地址属于项目，不属于 VPS。</p></div><button class="text-button" type="button" @click="addProjectEndpoint"><Plus :size="15" /> 添加入口</button></div><div v-if="projectForm.webEndpoints.length" class="endpoint-editor-list"><div v-for="(endpoint, index) in projectForm.webEndpoints" :key="index" class="endpoint-editor-row"><div class="endpoint-editor-grid"><label><span>显示名称</span><input v-model="endpoint.label" maxlength="120" placeholder="例如：主站" /></label><label><span>URL</span><input v-model="endpoint.url" required type="url" placeholder="https://example.com" /></label><label><span>端口</span><input v-model="endpoint.port" type="number" min="1" max="65535" placeholder="443" /></label><label><span>对应服务</span><input v-model="endpoint.serviceName" maxlength="100" placeholder="例如：site-nginx" /></label><label class="full"><span>备注</span><input v-model="endpoint.notes" maxlength="1000" placeholder="入口用途、反代上游或特殊说明" /></label></div><button class="mini-icon service-remove" type="button" title="移除入口" @click="removeProjectEndpoint(index)"><X :size="15" /></button></div></div><div v-else class="empty-inline">项目暂无 Web 入口</div></section>
                 <section class="modal-section"><div class="modal-section-heading"><div><h3>关联 VPS</h3><p>先选中项目涉及的服务器，再登记服务。</p></div><span>{{ projectForm.servers.length }} 台</span></div><div class="server-picker"><label v-for="server in dashboard?.servers ?? []" :key="server.id" class="server-picker-row"><input type="checkbox" :checked="hasProjectServer(server.id)" @change="toggleProjectServer(server.id)" /><span><strong>{{ server.name }}</strong><small>{{ server.address }}:{{ server.sshPort }}</small></span></label></div><div v-if="projectForm.servers.length" class="server-role-list"><label v-for="server in projectForm.servers" :key="server.serverId"><span>{{ serverNameById(server.serverId) }}</span><input v-model="server.role" maxlength="80" placeholder="角色，例如 primary / database" /></label></div></section>
         <section class="modal-section"><div class="modal-section-heading"><div><h3>服务清单</h3><p>记录容器名、systemd unit、端口和关键性。</p></div><button class="text-button" type="button" :disabled="!projectForm.servers.length" @click="addProjectService"><Plus :size="15" /> 添加服务</button></div><div v-if="projectForm.services.length" class="service-editor-list"><div v-for="(service, index) in projectForm.services" :key="index" class="service-editor-row"><div class="service-editor-grid"><label><span>所属 VPS</span><select v-model="service.serverId"><option v-for="server in projectForm.servers" :key="server.serverId" :value="server.serverId">{{ serverNameById(server.serverId) }}</option></select></label><label><span>服务名称</span><input v-model="service.name" required maxlength="100" placeholder="例如：Nginx" /></label><label><span>管理方式</span><select v-model="service.manager"><option value="docker">Docker</option><option value="systemd">systemd</option><option value="process">直接进程</option><option value="external">外部托管</option></select></label><label><span>标识</span><input v-model="service.identifier" required maxlength="160" placeholder="容器名或 unit 名" /></label><label><span>端口</span><input v-model="service.port" type="number" min="1" max="65535" placeholder="可选" /></label><label class="full"><span>端口映射</span><input v-model="service.portMappings" maxlength="4_000" placeholder="逗号分隔，例如 0.0.0.0:80-&gt;80/tcp, 内部: 5432/tcp" /></label><label><span>访问地址</span><input v-model="service.accessUrl" type="url" placeholder="可选" /></label><label class="service-critical"><input v-model="service.critical" type="checkbox" /><span>关键服务</span></label><label class="full"><span>备注</span><input v-model="service.notes" maxlength="4_000" placeholder="依赖、日志位置或特殊注意事项" /></label></div><button class="mini-icon service-remove" type="button" title="移除服务" @click="removeProjectService(index)"><X :size="15" /></button></div></div><div v-else class="empty-inline">尚未登记服务</div></section>
         <section class="modal-section runbook-editor-section"><div class="modal-section-heading"><div><h3>运维 Runbook</h3><p>保存给后续 AI 会话使用的操作资料，不要写入密码、Token 或私钥。</p></div></div><div class="runbook-editor-grid"><label v-for="section in runbookSections" :key="section.key"><span>{{ section.label }}</span><textarea v-model="projectForm.runbook[section.key]" rows="5" maxlength="12_000" :placeholder="section.placeholder"></textarea></label></div></section>

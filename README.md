@@ -29,6 +29,9 @@
 > [!IMPORTANT]
 > AI clients never receive private keys or an unrestricted SSH path. They request work from this loopback-only gateway, which owns the SSH process, serializes access per VPS, records high-risk actions, and keeps runtime data outside the repository.
 
+> [!NOTE]
+> The gateway is a local control boundary, not an operating-system sandbox. Processes running as the same macOS user may still access the gateway data directory. Use a protected user account and do not grant untrusted local software filesystem access.
+
 ## At a glance
 
 | Capability | What it provides |
@@ -250,3 +253,10 @@ Restart the client after registration if its tool list was already open. In a co
 ## License
 
 [MIT](./LICENSE)
+
+## Project Links
+
+- [Contributing](./CONTRIBUTING.md)
+- [Roadmap](./ROADMAP.md)
+- [Changelog](./CHANGELOG.md)
+- [Security policy](./SECURITY.md)

@@ -6,6 +6,7 @@ import fastifyStatic from "@fastify/static";
 import { z } from "zod";
 import { applyAllVpsSync, defaultAllVpsSourcePaths, loadAllVpsDocument, previewAllVpsSync, type AllVpsSourcePaths } from "./all-vps.js";
 import { GatewayDatabase } from "./db.js";
+import { GATEWAY_AUTH_COOKIE, gatewayApiToken, gatewayHealthProof, secureTokenEqual } from "./auth.js";
 import { redactText } from "./command-policy.js";
 import { discoveredProjectsForInventory } from "./inventory.js";
 import { GatewayOperationError, GatewayOperations, type GatewayOperationOptions } from "./operations.js";
@@ -45,13 +46,15 @@ const credentialRefSchema = z
   .max(160)
   .refine((value) => !/[\\/]/.test(value), "凭据引用不能包含路径分隔符");
 
+const webUrlSchema = z.string().url().refine((value) => /^https?:\/\//i.test(value), "只允许 HTTP 或 HTTPS URL");
+
 const healthCheckSchema = z
   .object({
     name: z.string().trim().min(1).max(80),
     kind: z.enum(["http", "tcp"]),
     enabled: z.boolean().optional(),
     config: z.object({
-      url: z.string().url().optional(),
+      url: webUrlSchema.optional(),
       host: hostSchema.optional(),
       port: z.number().int().min(1).max(65535).optional(),
       expectedStatusCodes: z.array(z.number().int().min(100).max(599)).max(12).optional(),
@@ -77,7 +80,7 @@ const serverSchemaFields = {
   credentialRef: credentialRefSchema.nullable(),
   role: z.string().trim().max(100),
   environment: z.string().trim().min(1).max(40),
-  accessUrl: z.string().url().nullable(),
+  accessUrl: webUrlSchema.nullable(),
   tags: z.array(z.string().trim().min(1).max(32)).max(20),
   maintenance: z.boolean(),
   healthChecks: z.array(healthCheckSchema).max(20)
@@ -116,13 +119,13 @@ const projectServiceSchema = z.object({
   identifier: z.string().trim().min(1).max(160).refine((value) => !/[\r\n]/.test(value), "服务标识不能包含换行"),
   port: z.number().int().min(1).max(65_535).nullable().optional(),
   portMappings: z.array(z.string().trim().min(1).max(160)).max(40).default([]),
-  accessUrl: z.string().url().nullable().optional(),
+  accessUrl: webUrlSchema.nullable().optional(),
   critical: z.boolean().default(false),
   notes: z.string().trim().max(4_000).default("")
 });
 const projectWebEndpointSchema = z.object({
   label: z.string().trim().min(1).max(120),
-  url: z.string().url(),
+  url: webUrlSchema,
   port: z.number().int().min(1).max(65_535).nullable().optional(),
   serviceName: z.string().trim().max(100).nullable().optional(),
   notes: z.string().trim().max(1_000).default(""),
@@ -133,7 +136,7 @@ const createProjectSchema = z
   .object({
     name: z.string().trim().min(1).max(100),
     description: z.string().trim().max(2_000).default(""),
-    repositoryUrl: z.string().url().nullable().optional(),
+    repositoryUrl: webUrlSchema.nullable().optional(),
     repositoryPath: z.string().trim().min(1).max(320).nullable().optional(),
     technologyStack: technologyStackSchema,
     webEndpoints: z.array(projectWebEndpointSchema).max(100).default([]),
@@ -158,7 +161,7 @@ const createProjectSchema = z
 const updateProjectSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
   description: z.string().trim().max(2_000).optional(),
-  repositoryUrl: z.string().url().nullable().optional(),
+  repositoryUrl: webUrlSchema.nullable().optional(),
   repositoryPath: z.string().trim().min(1).max(320).nullable().optional(),
   technologyStack: technologyStackSchema.optional(),
   webEndpoints: z.array(projectWebEndpointSchema).max(100).optional(),
@@ -303,6 +306,36 @@ function syncInventoryProjects(database: GatewayDatabase, server: ServerRecord, 
   return { serverId: server.id, collectedAt: inventory.collectedAt, inventory, projects, archived };
 }
 
+function sessionCapability(request: { headers: Record<string, string | string[] | undefined> }): string | undefined {
+  const value = request.headers["x-ai-vps-session-token"];
+  return typeof value === "string" ? value : undefined;
+}
+
+function gatewayRequestToken(request: { headers: Record<string, string | string[] | undefined> }): string | undefined {
+  const authorization = request.headers.authorization;
+  const bearer = typeof authorization === "string" && authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length)
+    : undefined;
+  const explicit = request.headers["x-ai-vps-gateway-token"];
+  if (typeof explicit === "string") return explicit;
+  if (bearer) return bearer;
+  const cookie = request.headers.cookie;
+  if (typeof cookie !== "string") return undefined;
+  return cookie
+    .split(";")
+    .map((item) => item.trim().split("="))
+    .find(([name]) => name === GATEWAY_AUTH_COOKIE)?.slice(1).join("=");
+}
+
+function requestHostname(host: string | undefined): string | null {
+  if (!host) return null;
+  try {
+    return new URL(`http://${host}`).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
 class ProbeScheduler {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
@@ -353,7 +386,7 @@ class MetricsScheduler {
     try {
       for (const server of this.database.listServers()) {
         if (server.maintenance || !server.credentialRef) continue;
-        await this.operations.collectMetrics(server.id, undefined, "scheduler:metrics");
+        await this.operations.collectMetrics(server.id, undefined, undefined, "scheduler:metrics");
       }
     } finally {
       this.running = false;
@@ -365,10 +398,13 @@ export interface GatewayOptions {
   allVpsSourcePaths?: AllVpsSourcePaths;
   operationOptions?: GatewayOperationOptions;
   staticDirectory?: string;
+  disableSchedulers?: boolean;
+  apiToken?: string | false;
 }
 
 export async function buildApp(database = new GatewayDatabase(), options: GatewayOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: process.env.NODE_ENV === "production" });
+  const apiToken = options.apiToken === false ? null : options.apiToken ?? gatewayApiToken(database.dataDirectory);
   const intervalMs = Math.min(Math.max(Number(process.env.ALLVPS_PROBE_INTERVAL_MS ?? 30_000), 10_000), 300_000);
   const scheduler = new ProbeScheduler(database, intervalMs);
   const metricsIntervalMs = Math.min(Math.max(Number(process.env.ALLVPS_METRICS_INTERVAL_MS ?? 5 * 60_000), 60_000), 60 * 60_000);
@@ -388,7 +424,71 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     methods: ["GET", "POST", "PATCH"]
   });
 
-  app.get("/api/health", () => ({ ok: true, mode: "local-only", version: "0.1.0" }));
+  app.addHook("onRequest", (request, reply, done) => {
+    const host = requestHostname(request.headers.host);
+    if (!host || !["127.0.0.1", "localhost", "::1"].includes(host)) {
+      void reply.code(421).send({ error: "MisdirectedRequest", message: "网关只接受本机 Host" });
+      return;
+    }
+    const origin = request.headers.origin;
+    if (origin) {
+      let allowed = false;
+      try {
+        const parsed = new URL(origin);
+        const requestHost = request.headers.host?.toLowerCase();
+        allowed = parsed.protocol === "http:" && (
+          parsed.host.toLowerCase() === requestHost ||
+          ["127.0.0.1:5173", "localhost:5173"].includes(parsed.host.toLowerCase())
+        );
+      } catch {
+        allowed = false;
+      }
+      if (!allowed) {
+        void reply.code(403).send({ error: "OriginRejected", message: "请求来源不属于本机网关" });
+        return;
+      }
+    }
+    if (!apiToken || !request.url.startsWith("/api/") || request.url.split("?", 1)[0] === "/api/health") {
+      done();
+      return;
+    }
+    if (!secureTokenEqual(gatewayRequestToken(request), apiToken)) {
+      void reply.code(401).send({ error: "AuthenticationRequired", message: "缺少有效的本机网关令牌" });
+      return;
+    }
+    done();
+  });
+
+  app.addHook("onSend", (request, reply, payload, done) => {
+    reply.header("x-content-type-options", "nosniff");
+    reply.header("referrer-policy", "no-referrer");
+    reply.header("x-frame-options", "DENY");
+    if (request.url.startsWith("/api/")) {
+      reply.header("cache-control", "no-store");
+    } else {
+      reply.header(
+        "content-security-policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+      );
+    }
+    if (apiToken && request.url === "/" && reply.statusCode < 400 && secureTokenEqual(gatewayRequestToken(request), apiToken)) {
+      reply.header("set-cookie", `${GATEWAY_AUTH_COOKIE}=${apiToken}; HttpOnly; SameSite=Strict; Path=/api`);
+    }
+    done(null, payload);
+  });
+
+  app.get("/api/health", (request) => {
+    const query = request.query as { challenge?: string };
+    const challenge = typeof query.challenge === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(query.challenge)
+      ? query.challenge
+      : null;
+    return {
+      ok: true,
+      mode: "local-only",
+      version: "0.1.1",
+      proof: apiToken && challenge ? gatewayHealthProof(apiToken, challenge) : null
+    };
+  });
 
   app.get("/api/dashboard", () => database.dashboard());
 
@@ -479,7 +579,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     const body = metricsSchema.safeParse(request.body ?? {});
     if (!body.success) return validationError(reply, body.error.issues);
     try {
-      const metric = await operations.collectMetrics(params.data.id, body.data.sessionId, "webui:metrics");
+      const metric = await operations.collectMetrics(params.data.id, body.data.sessionId, sessionCapability(request), "webui:metrics");
       return { metric };
     } catch (error) {
       return operationError(reply, error);
@@ -490,7 +590,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     const results: Array<{ serverId: string; metric?: ReturnType<GatewayDatabase["latestMetric"]>; error?: string }> = [];
     for (const server of database.listServersBySource("all-vps").filter((item) => !item.archivedAt)) {
       try {
-        results.push({ serverId: server.id, metric: await operations.collectMetrics(server.id, undefined, "webui:all-metrics") });
+        results.push({ serverId: server.id, metric: await operations.collectMetrics(server.id, undefined, undefined, "webui:all-metrics") });
       } catch (error) {
         results.push({ serverId: server.id, error: error instanceof Error ? error.message : "性能采集失败" });
       }
@@ -512,7 +612,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     const body = metricsSchema.safeParse(request.body ?? {});
     if (!body.success) return validationError(reply, body.error.issues);
     try {
-      const inventory = await operations.collectInventory(params.data.id, body.data.sessionId, "webui:inventory");
+      const inventory = await operations.collectInventory(params.data.id, body.data.sessionId, sessionCapability(request), "webui:inventory");
       return { inventory };
     } catch (error) {
       return operationError(reply, error);
@@ -527,7 +627,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     const server = database.getServer(params.data.id);
     if (!server) return reply.code(404).send({ error: "NotFound", message: "未找到 VPS" });
     try {
-      const inventory = await operations.collectInventory(server.id, body.data.sessionId, "webui:project-sync");
+      const inventory = await operations.collectInventory(server.id, body.data.sessionId, sessionCapability(request), "webui:project-sync");
       const result = syncInventoryProjects(database, server, inventory);
       database.audit("inventory.projects.synced", "server", server.id, `同步项目档案：${server.name}`, "info", {
         projects: result.projects.length,
@@ -545,7 +645,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     const results: Array<InventorySyncResult | { serverId: string; error: string }> = [];
     for (const server of database.listServersBySource("all-vps").filter((item) => !item.archivedAt)) {
       try {
-        const inventory = await operations.collectInventory(server.id, undefined, "webui:all-vps-project-sync");
+        const inventory = await operations.collectInventory(server.id, undefined, undefined, "webui:all-vps-project-sync");
         results.push(syncInventoryProjects(database, server, inventory));
       } catch (error) {
         results.push({ serverId: server.id, error: error instanceof Error ? error.message : "项目盘点失败" });
@@ -627,7 +727,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     const body = openSessionSchema.safeParse(request.body);
     if (!body.success) return validationError(reply, body.error.issues);
     try {
-      return reply.code(201).send({ session: operations.openSession(body.data.serverId, body.data.requester) });
+      return reply.code(201).send(operations.openSession(body.data.serverId, body.data.requester));
     } catch (error) {
       return operationError(reply, error);
     }
@@ -636,9 +736,15 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
   app.get("/api/sessions/:id", (request, reply) => {
     const params = idParamsSchema.safeParse(request.params);
     if (!params.success) return validationError(reply, params.error.issues);
-    const session = operations.getSession(params.data.id);
-    if (!session) return reply.code(404).send({ error: "NotFound", message: "未找到会话" });
-    return { session };
+    try {
+      const token = sessionCapability(request);
+      if (!token) return reply.code(403).send({ error: "MissingSessionCapability", message: "缺少会话能力令牌" });
+      const session = operations.getSession(params.data.id, token);
+      if (!session) return reply.code(404).send({ error: "NotFound", message: "未找到会话" });
+      return { session };
+    } catch (error) {
+      return operationError(reply, error);
+    }
   });
 
   app.post("/api/sessions/:id/commands", async (request, reply) => {
@@ -647,8 +753,10 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     const body = commandSchema.safeParse(request.body);
     if (!body.success) return validationError(reply, body.error.issues);
     try {
-      const result = await operations.runCommand(params.data.id, body.data.command, body.data.timeoutMs);
-      return { result, session: operations.getSession(params.data.id) };
+      const token = sessionCapability(request);
+      if (!token) return reply.code(403).send({ error: "MissingSessionCapability", message: "缺少会话能力令牌" });
+      const result = await operations.runCommand(params.data.id, token, body.data.command, body.data.timeoutMs);
+      return { result, session: operations.getSession(params.data.id, token) };
     } catch (error) {
       return operationError(reply, error);
     }
@@ -660,7 +768,9 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     const body = sessionCloseSchema.safeParse(request.body ?? {});
     if (!body.success) return validationError(reply, body.error.issues);
     try {
-      return operations.closeSession(params.data.id, body.data.reason);
+      const token = sessionCapability(request);
+      if (!token) return reply.code(403).send({ error: "MissingSessionCapability", message: "缺少会话能力令牌" });
+      return operations.closeSession(params.data.id, token, body.data.reason);
     } catch (error) {
       return operationError(reply, error);
     }
@@ -789,9 +899,11 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
   }
 
   app.addHook("onReady", () => {
-    scheduler.start();
     operations.start();
-    metricsScheduler.start();
+    if (!options.disableSchedulers && process.env.ALLVPS_DISABLE_SCHEDULERS !== "1") {
+      scheduler.start();
+      metricsScheduler.start();
+    }
   });
   app.addHook("onClose", () => {
     scheduler.stop();

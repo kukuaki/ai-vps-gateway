@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a focused improvement to the local VPS gateway.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What workflow is currently difficult or unsafe?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful behavior and its failure mode.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and data considerations
+      description: Explain whether this touches SSH keys, MCP capabilities, remote commands, audit data, or public exposure.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Scope checks
+      options:
+        - label: I understand this project is local-first and loopback-only by default.
+          required: true
+        - label: I will not include private keys, tokens, passwords, or production data.
+          required: true

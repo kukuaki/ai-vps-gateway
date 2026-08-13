@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { gatewayHealthProof } from "./auth.js";
 import { buildApp, DEFAULT_ROOT_ACCESS_DURATION_MS } from "./main.js";
 import { CredentialStore } from "./credentials.js";
 import { GatewayDatabase } from "./db.js";
@@ -17,6 +18,108 @@ afterEach(() => {
 });
 
 describe("local API", () => {
+  it("can disable background network schedulers for an isolated demo database", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-no-schedulers-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({ name: "离线演示节点", address: "203.0.113.90", sshPort: 22, sshUser: "ops" });
+    const checkedAt = "2026-08-12T00:00:00.000Z";
+    database.updateProbe(server.id, "healthy", checkedAt, null);
+    const app = await buildApp(database, { apiToken: false, disableSchedulers: true });
+    await app.ready();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    assert.equal(database.getServer(server.id)?.status, "healthy");
+    assert.equal(database.getServer(server.id)?.lastCheckedAt, checkedAt);
+    await app.close();
+  });
+
+  it("authenticates local API callers and rejects untrusted hosts and origins", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-auth-"));
+    temporaryDirectories.push(directory);
+    const staticDirectory = join(directory, "web");
+    mkdirSync(staticDirectory);
+    writeFileSync(join(staticDirectory, "index.html"), "<!doctype html><title>Gateway</title>");
+    const token = "a".repeat(43);
+    const database = new GatewayDatabase(directory);
+    const app = await buildApp(database, { apiToken: token, disableSchedulers: true, staticDirectory });
+    await app.ready();
+
+    const unauthenticated = await app.inject({ method: "GET", url: "/api/servers" });
+    assert.equal(unauthenticated.statusCode, 401);
+    assert.equal(unauthenticated.headers["cache-control"], "no-store");
+
+    const authenticated = await app.inject({
+      method: "GET",
+      url: "/api/servers",
+      headers: { authorization: `Bearer ${token}` }
+    });
+    assert.equal(authenticated.statusCode, 200);
+
+    const publicPage = await app.inject({
+      method: "GET",
+      url: "/",
+      headers: { host: "127.0.0.1:4318" }
+    });
+    assert.equal(publicPage.statusCode, 200);
+    assert.equal(publicPage.headers["set-cookie"], undefined);
+    assert.match(String(publicPage.headers["content-security-policy"]), /default-src 'self'/);
+    const page = await app.inject({
+      method: "GET",
+      url: "/",
+      headers: { host: "127.0.0.1:4318", "x-ai-vps-gateway-token": token }
+    });
+    assert.equal(page.statusCode, 200);
+    const cookie = page.headers["set-cookie"];
+    assert.equal(typeof cookie, "string");
+    assert.match(String(cookie), /HttpOnly; SameSite=Strict; Path=\/api/);
+    const cookieAuthenticated = await app.inject({
+      method: "GET",
+      url: "/api/servers",
+      headers: { host: "127.0.0.1:4318", cookie: String(cookie).split(";")[0] }
+    });
+    assert.equal(cookieAuthenticated.statusCode, 200);
+
+    const rejectedHost = await app.inject({
+      method: "GET",
+      url: "/api/servers",
+      headers: { host: "gateway.example.test", authorization: `Bearer ${token}` }
+    });
+    assert.equal(rejectedHost.statusCode, 421);
+
+    const rejectedOrigin = await app.inject({
+      method: "GET",
+      url: "/api/servers",
+      headers: { host: "127.0.0.1:4318", origin: "https://attacker.example.test", authorization: `Bearer ${token}` }
+    });
+    assert.equal(rejectedOrigin.statusCode, 403);
+
+    const allowedDevelopmentOrigin = await app.inject({
+      method: "GET",
+      url: "/api/servers",
+      headers: { host: "127.0.0.1:4318", origin: "http://localhost:5173", authorization: `Bearer ${token}` }
+    });
+    assert.equal(allowedDevelopmentOrigin.statusCode, 200);
+
+    const unsafeProjectUrl = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: "不安全链接", repositoryUrl: "javascript:alert(1)" }
+    });
+    assert.equal(unsafeProjectUrl.statusCode, 400);
+
+    const challenge = "local-desktop-check-1234";
+    const health = await app.inject({
+      method: "GET",
+      url: `/api/health?challenge=${challenge}`,
+      headers: { host: "[::1]:4318" }
+    });
+    assert.equal(health.statusCode, 200);
+    assert.equal(health.json().proof, gatewayHealthProof(token, challenge));
+    await app.close();
+  });
+
   it("generates a gateway-owned SSH key, returns only public bootstrap data, and binds after a non-interactive test", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-ssh-binding-"));
     temporaryDirectories.push(directory);
@@ -30,6 +133,8 @@ describe("local API", () => {
     const database = new GatewayDatabase(directory);
     const store = new CredentialStore(credentialsDirectory, knownHostsPath);
     const app = await buildApp(database, {
+      apiToken: false,
+      disableSchedulers: true,
       operationOptions: {
         sshExecutor: new SshExecutor({ credentialStore: store, sshBinary: fakeSshPath, directInterface: "en0" })
       }
@@ -79,7 +184,7 @@ describe("local API", () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-"));
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);
-    const app = await buildApp(database);
+    const app = await buildApp(database, { apiToken: false, disableSchedulers: true });
     await app.ready();
 
     const createdResponse = await app.inject({
@@ -129,6 +234,8 @@ describe("local API", () => {
 
     const database = new GatewayDatabase(directory);
     const app = await buildApp(database, {
+      apiToken: false,
+      disableSchedulers: true,
       allVpsSourcePaths: {
         directory: sourceDirectory,
         inventoryPath: join(sourceDirectory, "VPS_INVENTORY.md"),
@@ -165,7 +272,7 @@ describe("local API", () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-project-"));
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);
-    const app = await buildApp(database);
+    const app = await buildApp(database, { apiToken: false, disableSchedulers: true });
     await app.ready();
 
     const serverResponse = await app.inject({
@@ -217,7 +324,7 @@ describe("local API", () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-delete-"));
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);
-    const app = await buildApp(database);
+    const app = await buildApp(database, { apiToken: false, disableSchedulers: true });
     await app.ready();
 
     const serverResponse = await app.inject({
@@ -280,7 +387,7 @@ describe("local API", () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-metrics-"));
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);
-    const app = await buildApp(database);
+    const app = await buildApp(database, { apiToken: false, disableSchedulers: true });
     await app.ready();
     const server = database.createServer({ name: "性能 API 节点", address: "203.0.113.31", sshPort: 22, sshUser: "ubuntu" });
     database.saveMetric({
@@ -308,7 +415,7 @@ describe("local API", () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-root-"));
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);
-    const app = await buildApp(database);
+    const app = await buildApp(database, { apiToken: false, disableSchedulers: true });
     await app.ready();
 
     const serverResponse = await app.inject({

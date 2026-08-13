@@ -36,6 +36,7 @@ const hardBlockRules: Array<{ pattern: RegExp; reason: string }> = [
 function normalizedCommand(command: string): string {
   return command
     .toLowerCase()
+    .replace(/(['"])([^'"\r\n]*)\1\s*(['"])([^'"\r\n]*)\3/g, "$2$4")
     .replace(/\\[\s\n]*/g, "")
     .replace(/[\t\r\n]+/g, " ")
     .replace(/\s+/g, " ")
@@ -47,6 +48,10 @@ function containsRootRecursiveDelete(command: string): boolean {
   const hasRecursiveFlag = /(?:^|\s)-[^\s]*r|--recursive/i.test(command);
   if (!hasRecursiveFlag) return false;
   return /(?:^|[\s"'=;|&])\/(?:\s|\*|$|["';|&])/i.test(command) || /--no-preserve-root/i.test(command) && /\brm\b/i.test(command);
+}
+
+function containsRootFindDelete(command: string): boolean {
+  return /\bfind\s+(?:--\s+)?['"]?\/['"]?(?:\s|$)[\s\S]*\s-delete(?:\s|$)/i.test(command);
 }
 
 export function assessCommand(command: string): CommandAssessment {
@@ -64,7 +69,7 @@ export function assessCommand(command: string): CommandAssessment {
 
   const normalized = normalizedCommand(command);
   const matchedRule = hardBlockRules.find((rule) => rule.pattern.test(normalized));
-  if (matchedRule || containsRootRecursiveDelete(normalized)) {
+  if (matchedRule || containsRootRecursiveDelete(normalized) || containsRootFindDelete(normalized)) {
     return {
       risk: "critical",
       blocked: true,
@@ -103,8 +108,12 @@ export function redactText(value: string, maxBytes = MAX_OUTPUT_BYTES): { value:
   let redacted = value
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gi, "[REDACTED_PEM]")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/g, "[REDACTED_TOKEN]")
-    .replace(/(\b(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer)\b\s*[=:]\s*)([^\s,;&]+)/gi, "$1[REDACTED]")
-    .replace(/(\b(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer)\b\s+)([^\s,;&]+)/gi, "$1[REDACTED]");
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_JWT]")
+    .replace(/(\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|amqp(?:s)?)?:\/\/[^\s:/@]+:)([^\s/@]+)(@)/gi, "$1[REDACTED]$3")
+    .replace(/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)([^\s,;&]+)/gi, "$1[REDACTED]")
+    .replace(/(["']?(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|database[_-]?url|db[_-]?url|jwt)["']?\s*[=:]\s*)(["'])([\s\S]*?)\2/gi, "$1$2[REDACTED]$2")
+    .replace(/(\b(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|database[_-]?url|db[_-]?url|jwt)\b\s*[=:]\s*)([^\s,;&]+)/gi, "$1[REDACTED]")
+    .replace(/(\b(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|database[_-]?url|db[_-]?url|jwt)\b\s+)([^\s,;&]+)/gi, "$1[REDACTED]");
   const bytes = Buffer.byteLength(redacted, "utf8");
   if (bytes <= maxBytes) return { value: redacted, truncated: false };
   const buffer = Buffer.from(redacted, "utf8");

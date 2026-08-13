@@ -29,6 +29,13 @@ esac
   return binary;
 }
 
+function slowFakeSsh(directory: string): string {
+  const binary = join(directory, "slow-fake-ssh.sh");
+  writeFileSync(binary, "#!/bin/sh\nsleep 0.2\nprintf 'command-ok\\n'\n");
+  chmodSync(binary, 0o755);
+  return binary;
+}
+
 describe("gateway operations", () => {
   it("executes through a fake SSH process, redacts output and serializes sessions", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-operations-"));
@@ -53,26 +60,76 @@ describe("gateway operations", () => {
 
     const first = operations.openSession(server.id, "codex");
     const second = operations.openSession(server.id, "claude");
-    assert.equal(first.status, "active");
-    assert.equal(second.status, "queued");
+    assert.equal(first.session.status, "active");
+    assert.equal(second.session.status, "queued");
 
-    const result = await operations.runCommand(first.id, "printf ok");
+    const result = await operations.runCommand(first.session.id, first.capabilityToken, "printf ok");
     assert.equal(result.outcome, "completed");
     assert.match(result.stdout, /command-ok/);
     assert.doesNotMatch(result.stdout, /hunter2|secret/);
 
-    const metric = await operations.collectMetrics(server.id, first.id);
+    const metric = await operations.collectMetrics(server.id, first.session.id, first.capabilityToken);
     assert.equal(metric.source, "ssh");
     assert.equal(metric.cpuPercent, 12.5);
     assert.equal(metric.memoryPercent, 34.5);
     assert.equal(metric.diskPercent, 45);
     assert.equal(metric.load1, 0.42);
 
-    const blocked = await operations.runCommand(first.id, "rm -rf / --no-preserve-root");
+    const blocked = await operations.runCommand(first.session.id, first.capabilityToken, "rm -rf / --no-preserve-root");
     assert.equal(blocked.outcome, "blocked");
     assert.equal(blocked.exitCode, null);
-    const closed = operations.closeSession(first.id);
-    assert.equal(closed.promoted?.id, second.id);
+    const closed = operations.closeSession(first.session.id, first.capabilityToken);
+    assert.equal(closed.promoted?.id, second.session.id);
+    database.close();
+  });
+
+  it("requires the session capability and serializes remote operations until completion", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-operation-lock-"));
+    temporaryDirectories.push(directory);
+    const credentials = join(directory, "credentials");
+    const knownHosts = join(directory, "known_hosts");
+    mkdirSync(credentials);
+    writeFileSync(join(credentials, "test-key"), "test");
+    writeFileSync(knownHosts, "[203.0.113.55]:22 ssh-ed25519 test\n");
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({
+      name: "并发测试节点",
+      address: "203.0.113.55",
+      sshPort: 22,
+      sshUser: "ubuntu",
+      credentialRef: "test-key"
+    });
+    const operations = new GatewayOperations(database, {
+      sshExecutor: new SshExecutor({
+        credentialStore: new CredentialStore(credentials, knownHosts),
+        sshBinary: slowFakeSsh(directory),
+        timeoutMs: 5_000
+      }),
+      idleTimeoutMs: 60_000,
+      maxSessionDurationMs: 600_000
+    });
+    const first = operations.openSession(server.id, "codex");
+    const second = operations.openSession(server.id, "claude");
+
+    await assert.rejects(
+      operations.runCommand(first.session.id, second.capabilityToken, "printf unauthorized"),
+      (error: unknown) => error instanceof GatewayOperationError && error.code === "InvalidSessionCapability"
+    );
+
+    const running = operations.runCommand(first.session.id, first.capabilityToken, "printf first");
+    await assert.rejects(
+      operations.runCommand(first.session.id, first.capabilityToken, "printf second"),
+      (error: unknown) => error instanceof GatewayOperationError && error.code === "SessionOperationInFlight"
+    );
+    assert.throws(
+      () => operations.closeSession(first.session.id, first.capabilityToken),
+      (error: unknown) => error instanceof GatewayOperationError && error.code === "SessionOperationInFlight"
+    );
+    assert.equal(database.getSession(second.session.id, 60_000)?.status, "queued");
+
+    assert.equal((await running).outcome, "completed");
+    const closed = operations.closeSession(first.session.id, first.capabilityToken);
+    assert.equal(closed.promoted?.id, second.session.id);
     database.close();
   });
 
@@ -149,16 +206,16 @@ load1=0.42
     });
 
     const session = operations.openSession(server.id, "codex");
-    assert.equal(session.status, "active");
+    assert.equal(session.session.status, "active");
     assert.equal(database.emergencyRootActive(server.id), false);
-    const command = await operations.runCommand(session.id, "printf ok");
+    const command = await operations.runCommand(session.session.id, session.capabilityToken, "printf ok");
     assert.equal(command.outcome, "completed");
-    const metric = await operations.collectMetrics(server.id, session.id);
+    const metric = await operations.collectMetrics(server.id, session.session.id, session.capabilityToken);
     assert.equal(metric.source, "ssh");
 
     database.grantEmergencyRoot(server.id, 60_000);
     operations.revokeEmergencyRoot(server.id);
-    assert.equal(database.getSession(session.id, 60_000)?.status, "active");
+    assert.equal(database.getSession(session.session.id, 60_000)?.status, "active");
     database.close();
   });
 

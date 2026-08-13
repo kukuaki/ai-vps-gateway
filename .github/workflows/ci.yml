@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   verify:
@@ -18,3 +19,18 @@ jobs:
       - run: npm run typecheck
       - run: npm run test
       - run: npm run build
+      - run: npm run check:release-safety
+
+  desktop-runtime:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build:desktop-runtime
+      - run: test -s dist-electron/main.cjs
+      - run: test -s dist-electron/preload.cjs
+      - run: test -s dist-electron/mcp.cjs

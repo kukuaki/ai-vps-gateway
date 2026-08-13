@@ -117,6 +117,8 @@ interface RawSession {
   max_expires_at: string;
   closed_at: string | null;
   close_reason: string | null;
+  capability_hash: string;
+  operation_in_flight: number;
   queue_position: number;
   active_session_id: string | null;
 }
@@ -150,6 +152,7 @@ interface RawProject {
   technology_stack_json: string;
   web_endpoints_json: string;
   runbook_json: string;
+  inventory_baseline_json: string | null;
   archived_at: string | null;
   created_at: string;
   updated_at: string;
@@ -189,6 +192,29 @@ interface RawProjectService {
   notes: string;
   created_at: string;
   updated_at: string;
+}
+
+interface InventoryProjectServiceSnapshot {
+  serverId: string;
+  name: string;
+  manager: ServiceManager;
+  identifier: string;
+  port: number | null;
+  portMappings: string[];
+  accessUrl: string | null;
+  critical: boolean;
+  notes: string;
+}
+
+interface InventoryProjectBaseline {
+  version: 1;
+  name: string;
+  description: string;
+  repositoryPath: string | null;
+  technologyStack: string[];
+  webEndpoints: ProjectWebEndpoint[];
+  runbook: ProjectRunbook;
+  services: InventoryProjectServiceSnapshot[];
 }
 
 export function defaultDataDirectory(): string {
@@ -255,17 +281,7 @@ function normalizedStringList(values: string[] | undefined | null): string[] {
   return [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
 }
 
-function comparableProjectServices(services: Array<ProjectService | ProjectServiceInput>): Array<{
-  serverId: string;
-  name: string;
-  manager: ServiceManager;
-  identifier: string;
-  port: number | null;
-  portMappings: string[];
-  accessUrl: string | null;
-  critical: boolean;
-  notes: string;
-}> {
+function comparableProjectServices(services: Array<ProjectService | ProjectServiceInput>): InventoryProjectServiceSnapshot[] {
   return services
     .map((service) => ({
       serverId: service.serverId,
@@ -284,6 +300,101 @@ function comparableProjectServices(services: Array<ProjectService | ProjectServi
       left.manager.localeCompare(right.manager) ||
       left.identifier.localeCompare(right.identifier)
     );
+}
+
+function projectServiceSnapshotKey(service: InventoryProjectServiceSnapshot): string {
+  return `${service.serverId}\u0000${service.manager}\u0000${service.identifier}`;
+}
+
+function isLegacyInventoryService(service: InventoryProjectServiceSnapshot): boolean {
+  return /来源：[^\n]+的只读 SSH 盘点/.test(service.notes);
+}
+
+function inventoryProjectBaseline(
+  input: DiscoveredProjectInput,
+  technologyStack: string[],
+  webEndpoints: ProjectWebEndpoint[],
+  services: ProjectServiceInput[]
+): InventoryProjectBaseline {
+  return {
+    version: 1,
+    name: input.name,
+    description: input.description,
+    repositoryPath: input.repositoryPath ?? null,
+    technologyStack,
+    webEndpoints,
+    runbook: input.runbook,
+    services: comparableProjectServices(services)
+  };
+}
+
+function parseInventoryProjectBaseline(value: string | null): InventoryProjectBaseline | null {
+  if (!value) return null;
+  const baseline = parseJson<InventoryProjectBaseline | null>(value, null);
+  return baseline?.version === 1 ? baseline : null;
+}
+
+function mergeInventoryRunbook(
+  current: ProjectRunbook,
+  previous: ProjectRunbook | null,
+  discovered: ProjectRunbook
+): ProjectRunbook {
+  if (!previous) return current;
+  return {
+    overview: current.overview === previous.overview ? discovered.overview : current.overview,
+    deployment: current.deployment === previous.deployment ? discovered.deployment : current.deployment,
+    verification: current.verification === previous.verification ? discovered.verification : current.verification,
+    troubleshooting: current.troubleshooting === previous.troubleshooting ? discovered.troubleshooting : current.troubleshooting,
+    guardrails: current.guardrails === previous.guardrails ? discovered.guardrails : current.guardrails
+  };
+}
+
+function mergeInventoryTechnologyStack(
+  current: string[],
+  previous: string[] | null,
+  discovered: string[]
+): string[] {
+  if (!previous) return current;
+  const currentSet = new Set(current);
+  const previousSet = new Set(previous);
+  const manualAdditions = current.filter((item) => !previousSet.has(item));
+  const manualRemovals = new Set(previous.filter((item) => !currentSet.has(item)));
+  return normalizedStringList([...discovered.filter((item) => !manualRemovals.has(item)), ...manualAdditions]);
+}
+
+function mergeInventoryServices(
+  currentServices: ProjectService[],
+  previousBaseline: InventoryProjectBaseline | null,
+  discoveredServices: ProjectServiceInput[]
+): ProjectServiceInput[] {
+  const current = new Map(comparableProjectServices(currentServices).map((service) => [projectServiceSnapshotKey(service), service]));
+  const previous = new Map((previousBaseline?.services ?? []).map((service) => [projectServiceSnapshotKey(service), service]));
+  const discovered = comparableProjectServices(discoveredServices);
+  const discoveredKeys = new Set(discovered.map(projectServiceSnapshotKey));
+  const previousAutomaticKeys = previousBaseline
+    ? new Set(previous.keys())
+    : new Set([...current.values()].filter((service) => discoveredKeys.has(projectServiceSnapshotKey(service)) || isLegacyInventoryService(service)).map(projectServiceSnapshotKey));
+
+  const merged = discovered.map((service) => {
+    const key = projectServiceSnapshotKey(service);
+    const currentService = current.get(key);
+    const previousService = previous.get(key);
+    return {
+      ...service,
+      critical: currentService
+        ? previousService && currentService.critical === previousService.critical ? service.critical : currentService.critical
+        : service.critical,
+      notes: currentService
+        ? previousService && currentService.notes === previousService.notes ? service.notes : currentService.notes
+        : service.notes
+    };
+  });
+
+  for (const service of current.values()) {
+    const key = projectServiceSnapshotKey(service);
+    if (!discoveredKeys.has(key) && !previousAutomaticKeys.has(key)) merged.push(service);
+  }
+  return comparableProjectServices(merged);
 }
 
 function normalizedWebEndpoints(values: ProjectWebEndpoint[] | undefined | null): ProjectWebEndpoint[] {
@@ -332,7 +443,8 @@ function toSession(raw: RawSession): SessionRecord {
     closedAt: raw.closed_at,
     closeReason: raw.close_reason,
     queuePosition: raw.status === "queued" ? raw.queue_position : 0,
-    activeSessionId: raw.status === "active" ? null : raw.active_session_id
+    activeSessionId: raw.status === "active" ? null : raw.active_session_id,
+    operationInFlight: raw.operation_in_flight === 1
   };
 }
 
@@ -504,7 +616,9 @@ export class GatewayDatabase {
         idle_expires_at TEXT,
         max_expires_at TEXT NOT NULL,
         closed_at TEXT,
-        close_reason TEXT
+        close_reason TEXT,
+        capability_hash TEXT NOT NULL DEFAULT '',
+        operation_in_flight INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS command_runs (
@@ -536,6 +650,7 @@ export class GatewayDatabase {
         technology_stack_json TEXT NOT NULL DEFAULT '[]',
         web_endpoints_json TEXT NOT NULL DEFAULT '[]',
         runbook_json TEXT NOT NULL DEFAULT '{}',
+        inventory_baseline_json TEXT,
         archived_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -577,7 +692,10 @@ export class GatewayDatabase {
     this.addProjectColumnIfMissing("source_synced_at TEXT");
     this.addProjectColumnIfMissing("technology_stack_json TEXT NOT NULL DEFAULT '[]'");
     this.addProjectColumnIfMissing("web_endpoints_json TEXT NOT NULL DEFAULT '[]'");
+    this.addProjectColumnIfMissing("inventory_baseline_json TEXT");
     this.addProjectServiceColumnIfMissing("port_mappings_json TEXT NOT NULL DEFAULT '[]'");
+    this.addSessionColumnIfMissing("capability_hash TEXT NOT NULL DEFAULT ''");
+    this.addSessionColumnIfMissing("operation_in_flight INTEGER NOT NULL DEFAULT 0");
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_source_key
         ON servers(source_key) WHERE source_key IS NOT NULL;
@@ -623,6 +741,14 @@ export class GatewayDatabase {
       if (!(error instanceof Error) || !error.message.includes("duplicate column name")) {
         throw error;
       }
+    }
+  }
+
+  private addSessionColumnIfMissing(definition: string): void {
+    try {
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN ${definition}`);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes("duplicate column name")) throw error;
     }
   }
 
@@ -1053,6 +1179,7 @@ export class GatewayDatabase {
         UPDATE sessions
         SET status = 'expired', closed_at = ?, close_reason = 'lease_expired'
         WHERE status = 'active'
+          AND operation_in_flight = 0
           AND (max_expires_at <= ? OR (idle_expires_at IS NOT NULL AND idle_expires_at <= ?))
       `)
       .run(timestamp, timestamp, timestamp);
@@ -1074,6 +1201,7 @@ export class GatewayDatabase {
   openSession(
     serverId: string,
     requester: string,
+    capabilityHash: string,
     idleTimeoutMs: number,
     maxDurationMs: number,
     queueIfBusy = true
@@ -1094,10 +1222,10 @@ export class GatewayDatabase {
       this.db
         .prepare(`
           INSERT INTO sessions
-            (id, server_id, requester, status, created_at, activated_at, last_activity_at, idle_expires_at, max_expires_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, server_id, requester, status, created_at, activated_at, last_activity_at, idle_expires_at, max_expires_at, capability_hash)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
-        .run(id, serverId, requester, hasActive ? "queued" : "active", timestamp, hasActive ? null : timestamp, hasActive ? null : timestamp, idleExpiresAt, maxExpiresAt);
+        .run(id, serverId, requester, hasActive ? "queued" : "active", timestamp, hasActive ? null : timestamp, hasActive ? null : timestamp, idleExpiresAt, maxExpiresAt, capabilityHash);
       return toSession(this.rawSession(id) as RawSession);
     });
   }
@@ -1150,12 +1278,76 @@ export class GatewayDatabase {
     });
   }
 
+  sessionCapabilityMatches(sessionId: string, capabilityHash: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS matches FROM sessions WHERE id = ? AND capability_hash = ?")
+      .get(sessionId, capabilityHash) as unknown as { matches: number } | undefined;
+    return Boolean(row);
+  }
+
+  acquireSessionOperation(
+    sessionId: string,
+    capabilityHash: string,
+    idleTimeoutMs: number
+  ): { status: "acquired"; session: SessionRecord } | { status: "not_found" | "unauthorized" | "inactive" | "busy"; session: SessionRecord | null } {
+    const timestamp = now();
+    return this.transaction(() => {
+      this.reconcileSessionsAt(timestamp, idleTimeoutMs);
+      const current = this.rawSession(sessionId);
+      if (!current) return { status: "not_found", session: null };
+      const session = toSession(current);
+      if (current.capability_hash !== capabilityHash) return { status: "unauthorized", session };
+      if (current.status !== "active") return { status: "inactive", session };
+      if (current.operation_in_flight === 1) return { status: "busy", session };
+      const idleExpiresAt = new Date(
+        Math.min(Date.parse(current.max_expires_at), Date.parse(timestamp) + idleTimeoutMs)
+      ).toISOString();
+      const changed = this.db
+        .prepare(`
+          UPDATE sessions
+          SET operation_in_flight = 1, last_activity_at = ?, idle_expires_at = ?
+          WHERE id = ? AND status = 'active' AND operation_in_flight = 0 AND capability_hash = ?
+        `)
+        .run(timestamp, idleExpiresAt, sessionId, capabilityHash).changes;
+      if (!changed) return { status: "busy", session: toSession(this.rawSession(sessionId) as RawSession) };
+      return { status: "acquired", session: toSession(this.rawSession(sessionId) as RawSession) };
+    });
+  }
+
+  releaseSessionOperation(sessionId: string, idleTimeoutMs: number): SessionRecord | null {
+    const timestamp = now();
+    return this.transaction(() => {
+      const current = this.rawSession(sessionId);
+      if (!current) return null;
+      const idleExpiresAt = new Date(
+        Math.min(Date.parse(current.max_expires_at), Date.parse(timestamp) + idleTimeoutMs)
+      ).toISOString();
+      this.db
+        .prepare(`
+          UPDATE sessions
+          SET operation_in_flight = 0,
+              last_activity_at = CASE WHEN status = 'active' THEN ? ELSE last_activity_at END,
+              idle_expires_at = CASE WHEN status = 'active' THEN ? ELSE idle_expires_at END
+          WHERE id = ?
+        `)
+        .run(timestamp, idleExpiresAt, sessionId);
+      this.reconcileSessionsAt(timestamp, idleTimeoutMs);
+      const released = this.rawSession(sessionId);
+      return released ? toSession(released) : null;
+    });
+  }
+
+  recoverInterruptedSessionOperations(): number {
+    return Number(this.db.prepare("UPDATE sessions SET operation_in_flight = 0 WHERE operation_in_flight = 1").run().changes);
+  }
+
   closeSession(sessionId: string, idleTimeoutMs: number, reason = "closed_by_operator"): { session: SessionRecord; promoted: SessionRecord | null } | null {
     const timestamp = now();
     return this.transaction(() => {
       this.reconcileSessionsAt(timestamp, idleTimeoutMs);
       const current = this.rawSession(sessionId);
       if (!current || !["active", "queued"].includes(current.status)) return null;
+      if (current.operation_in_flight === 1) return null;
       this.db
         .prepare("UPDATE sessions SET status = 'closed', closed_at = ?, close_reason = ?, idle_expires_at = NULL WHERE id = ?")
         .run(timestamp, reason, sessionId);
@@ -1314,10 +1506,11 @@ export class GatewayDatabase {
 
   syncDiscoveredProject(input: DiscoveredProjectInput): { action: InventorySyncAction; project: ProjectDetail } {
     const servers: ProjectServerInput[] = [{ serverId: input.serverId, role: "运行节点" }];
-    const services = input.services ?? [];
+    const discoveredServices = input.services ?? [];
     const discoveredTechnologyStack = normalizedStringList(input.technologyStack);
     const discoveredWebEndpoints = normalizedWebEndpoints(input.webEndpoints);
-    this.assertProjectResources(servers, services);
+    const discoveredBaseline = inventoryProjectBaseline(input, discoveredTechnologyStack, discoveredWebEndpoints, discoveredServices);
+    this.assertProjectResources(servers, discoveredServices);
     const existingRow = this.db
       .prepare("SELECT id FROM projects WHERE source = 'remote-inventory' AND source_key = ?")
       .get(input.sourceKey) as unknown as { id: string } | undefined;
@@ -1328,8 +1521,8 @@ export class GatewayDatabase {
         this.db
           .prepare(`
             INSERT INTO projects
-              (id, source, source_key, source_synced_at, name, description, repository_url, repository_path, technology_stack_json, web_endpoints_json, runbook_json, created_at, updated_at)
-            VALUES (?, 'remote-inventory', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+              (id, source, source_key, source_synced_at, name, description, repository_url, repository_path, technology_stack_json, web_endpoints_json, runbook_json, inventory_baseline_json, created_at, updated_at)
+            VALUES (?, 'remote-inventory', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
           `)
           .run(
             id,
@@ -1341,40 +1534,78 @@ export class GatewayDatabase {
             JSON.stringify(discoveredTechnologyStack),
             JSON.stringify(discoveredWebEndpoints),
             JSON.stringify(input.runbook),
+            JSON.stringify(discoveredBaseline),
             timestamp,
             timestamp
           );
         this.replaceProjectServers(id, servers);
-        this.replaceProjectServices(id, services, timestamp);
+        this.replaceProjectServices(id, discoveredServices, timestamp);
       });
       return { action: "created", project: this.getProject(id) as ProjectDetail };
     }
 
     const existing = this.getProject(existingRow.id, true);
     if (!existing) throw new Error(`自动发现项目不存在：${input.sourceKey}`);
-    const sameServices = JSON.stringify(comparableProjectServices(existing.services)) === JSON.stringify(comparableProjectServices(services));
+    const rawExisting = this.rawProject(existing.id, true) as RawProject;
+    const storedBaseline = parseInventoryProjectBaseline(rawExisting.inventory_baseline_json);
+    const previousBaseline = storedBaseline ?? (
+      rawExisting.source_synced_at === rawExisting.updated_at
+        ? {
+            version: 1,
+            name: existing.name,
+            description: existing.description,
+            repositoryPath: existing.repositoryPath,
+            technologyStack: existing.technologyStack,
+            webEndpoints: existing.webEndpoints.filter((endpoint) => endpoint.source === "remote-inventory"),
+            runbook: existing.runbook,
+            services: comparableProjectServices(existing.services)
+          }
+        : null
+    );
+    const nextName = previousBaseline && existing.name === previousBaseline.name ? input.name : existing.name;
+    const nextDescription = previousBaseline && existing.description === previousBaseline.description ? input.description : existing.description;
+    const nextRepositoryPath = previousBaseline && existing.repositoryPath === previousBaseline.repositoryPath
+      ? input.repositoryPath ?? null
+      : existing.repositoryPath;
+    const nextRunbook = mergeInventoryRunbook(existing.runbook, previousBaseline?.runbook ?? null, input.runbook);
     const preservedManualEndpoints = existing.webEndpoints.filter((endpoint) => endpoint.source === "manual");
-    const nextWebEndpoints = normalizedWebEndpoints([...preservedManualEndpoints, ...discoveredWebEndpoints]);
-    // 远程盘点以本次实际发现的运行栈为准，不能把已停止项目的旧标签永久带入新的快照。
-    const nextTechnologyStack = discoveredTechnologyStack;
-    const unchanged = existing.name === input.name &&
-      existing.description === input.description &&
-      existing.repositoryPath === (input.repositoryPath ?? null) &&
-      JSON.stringify(existing.runbook) === JSON.stringify(input.runbook) &&
+    const nextWebEndpoints = normalizedWebEndpoints([...discoveredWebEndpoints, ...preservedManualEndpoints]);
+    const nextTechnologyStack = mergeInventoryTechnologyStack(
+      existing.technologyStack,
+      previousBaseline?.technologyStack ?? null,
+      discoveredTechnologyStack
+    );
+    const nextServices = mergeInventoryServices(existing.services, previousBaseline, discoveredServices);
+    this.assertProjectResources(servers, nextServices);
+    const unchanged = existing.name === nextName &&
+      existing.description === nextDescription &&
+      existing.repositoryPath === nextRepositoryPath &&
+      JSON.stringify(existing.runbook) === JSON.stringify(nextRunbook) &&
       JSON.stringify(existing.technologyStack) === JSON.stringify(nextTechnologyStack) &&
       JSON.stringify(existing.webEndpoints) === JSON.stringify(nextWebEndpoints) &&
-      sameServices &&
+      JSON.stringify(comparableProjectServices(existing.services)) === JSON.stringify(comparableProjectServices(nextServices)) &&
       existing.archivedAt === null;
 
     this.transaction(() => {
       this.db
         .prepare(`
-            UPDATE projects SET source_synced_at = ?, name = ?, description = ?, repository_path = ?, technology_stack_json = ?, web_endpoints_json = ?, runbook_json = ?,
+            UPDATE projects SET source_synced_at = ?, name = ?, description = ?, repository_path = ?, technology_stack_json = ?, web_endpoints_json = ?, runbook_json = ?, inventory_baseline_json = ?,
             archived_at = NULL, updated_at = ? WHERE id = ?
           `)
-        .run(timestamp, input.name, input.description, input.repositoryPath ?? null, JSON.stringify(nextTechnologyStack), JSON.stringify(nextWebEndpoints), JSON.stringify(input.runbook), timestamp, existing.id);
+        .run(
+          timestamp,
+          nextName,
+          nextDescription,
+          nextRepositoryPath,
+          JSON.stringify(nextTechnologyStack),
+          JSON.stringify(nextWebEndpoints),
+          JSON.stringify(nextRunbook),
+          JSON.stringify(discoveredBaseline),
+          timestamp,
+          existing.id
+        );
       this.replaceProjectServers(existing.id, servers);
-      this.replaceProjectServices(existing.id, services, timestamp);
+      this.replaceProjectServices(existing.id, nextServices, timestamp);
     });
     return { action: unchanged ? "unchanged" : "updated", project: this.getProject(existing.id) as ProjectDetail };
   }

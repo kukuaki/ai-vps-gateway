@@ -2,7 +2,8 @@
 
 set -u
 
-PROJECT_DIR="${AI_VPS_GATEWAY_DIR:-/Users/kukuaki/Desktop/ai-vps-gateway}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="${AI_VPS_GATEWAY_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 SERVICE="${1:-}"
 
 fail() {

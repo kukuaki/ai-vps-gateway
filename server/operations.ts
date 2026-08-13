@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { GatewayDatabase } from "./db.js";
 import { assessCommand, displayCommand, redactText } from "./command-policy.js";
 import { buildSshBootstrapCommand, CredentialError } from "./credentials.js";
@@ -48,6 +49,19 @@ export interface GatewayOperationOptions {
 export interface SshBindingResult {
   server: ServerRecord;
   binding: SshBindingInfo;
+}
+
+export interface SessionLease {
+  session: SessionRecord;
+  capabilityToken: string;
+}
+
+function newCapabilityToken(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+function capabilityHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
 }
 
 function boundedDuration(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
@@ -166,10 +180,11 @@ export class GatewayOperations {
 
   start(): void {
     if (this.timer) return;
+    this.database.recoverInterruptedSessionOperations();
     this.reconcile();
     for (const session of this.database.listActiveSessions(this.idleTimeoutMs)) {
       if (session.status === "active" && transientRequester(session.requester)) {
-        this.closeSession(session.id, "gateway_restarted_transient");
+        this.closeSessionInternal(session.id, "gateway_restarted_transient");
       }
     }
     this.timer = setInterval(() => this.reconcile(), this.sweepIntervalMs);
@@ -191,7 +206,10 @@ export class GatewayOperations {
     return this.database.listActiveSessions(this.idleTimeoutMs);
   }
 
-  getSession(sessionId: string): SessionDetail | null {
+  getSession(sessionId: string, capabilityToken: string): SessionDetail | null {
+    if (!this.database.sessionCapabilityMatches(sessionId, capabilityHash(capabilityToken))) {
+      throw new GatewayOperationError(403, "InvalidSessionCapability", "会话能力令牌无效或已失效");
+    }
     return this.database.getSession(sessionId, this.idleTimeoutMs);
   }
 
@@ -360,7 +378,7 @@ export class GatewayOperations {
     return { deleted: true, serverId, credentialRemoved };
   }
 
-  openSession(serverId: string, requester?: string): SessionRecord {
+  openSession(serverId: string, requester?: string): SessionLease {
     const server = this.database.getServer(serverId);
     if (!server) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
     try {
@@ -372,9 +390,11 @@ export class GatewayOperations {
     if (!this.ssh.credentialStore.hasKnownHosts()) {
       throw new GatewayOperationError(409, "KnownHostsUnavailable", "本机没有可用的 SSH known_hosts，先完成主机指纹登记");
     }
+    const capabilityToken = newCapabilityToken();
     const session = this.database.openSession(
       serverId,
       requesterName(requester),
+      capabilityHash(capabilityToken),
       this.idleTimeoutMs,
       this.maxSessionDurationMs
     );
@@ -387,10 +407,21 @@ export class GatewayOperations {
       session.status === "active" ? "info" : "warning",
       { serverId, requester: session.requester, status: session.status, queuePosition: session.queuePosition }
     );
-    return session;
+    return { session, capabilityToken };
   }
 
-  closeSession(sessionId: string, reason = "closed_by_operator"): { session: SessionRecord; promoted: SessionRecord | null } {
+  closeSession(sessionId: string, capabilityToken: string, reason = "closed_by_operator"): { session: SessionRecord; promoted: SessionRecord | null } {
+    if (!this.database.sessionCapabilityMatches(sessionId, capabilityHash(capabilityToken))) {
+      throw new GatewayOperationError(403, "InvalidSessionCapability", "会话能力令牌无效或已失效");
+    }
+    const current = this.database.getSession(sessionId, this.idleTimeoutMs);
+    if (current?.operationInFlight) {
+      throw new GatewayOperationError(409, "SessionOperationInFlight", "会话仍有远程操作执行中，完成后才能释放");
+    }
+    return this.closeSessionInternal(sessionId, reason);
+  }
+
+  private closeSessionInternal(sessionId: string, reason: string): { session: SessionRecord; promoted: SessionRecord | null } {
     const result = this.database.closeSession(sessionId, this.idleTimeoutMs, reason);
     if (!result) throw new GatewayOperationError(404, "NotFound", "未找到可关闭的会话");
     this.database.audit("session.closed", "session", sessionId, "关闭 VPS 会话", "info", { reason });
@@ -414,113 +445,120 @@ export class GatewayOperations {
     return updated;
   }
 
-  async runCommand(sessionId: string, command: string, timeoutMs?: number): Promise<CommandExecutionResult> {
-    const session = this.database.getSession(sessionId, this.idleTimeoutMs);
-    if (!session) throw new GatewayOperationError(404, "NotFound", "未找到会话");
-    if (session.status !== "active") {
-      throw new GatewayOperationError(409, "SessionNotActive", session.status === "queued" ? "会话仍在排队，当前 VPS 由其他会话占用" : "会话已结束，不能继续执行命令", {
-        session
-      });
-    }
-    const server = this.database.getServer(session.serverId);
-    if (!server) throw new GatewayOperationError(404, "NotFound", "会话对应的 VPS 不存在");
-    const assessment = assessCommand(command);
-    const safeCommand = displayCommand(command);
-    const createdAt = new Date().toISOString();
+  private acquireSessionOperation(sessionId: string, capabilityToken: string): SessionRecord {
+    const acquired = this.database.acquireSessionOperation(sessionId, capabilityHash(capabilityToken), this.idleTimeoutMs);
+    if (acquired.status === "acquired") return acquired.session;
+    if (acquired.status === "not_found") throw new GatewayOperationError(404, "NotFound", "未找到会话");
+    if (acquired.status === "unauthorized") throw new GatewayOperationError(403, "InvalidSessionCapability", "会话能力令牌无效或已失效");
+    if (acquired.status === "busy") throw new GatewayOperationError(409, "SessionOperationInFlight", "该会话已有远程操作执行中，请等待完成");
+    throw new GatewayOperationError(409, "SessionNotActive", acquired.session?.status === "queued" ? "会话仍在排队，当前 VPS 由其他会话占用" : "会话已结束，不能继续执行操作", {
+      session: acquired.session
+    });
+  }
 
-    if (assessment.blocked) {
+  async runCommand(sessionId: string, capabilityToken: string, command: string, timeoutMs?: number): Promise<CommandExecutionResult> {
+    const session = this.acquireSessionOperation(sessionId, capabilityToken);
+    const server = this.database.getServer(session.serverId);
+    try {
+      if (!server) throw new GatewayOperationError(404, "NotFound", "会话对应的 VPS 不存在");
+      const assessment = assessCommand(command);
+      const safeCommand = displayCommand(command);
+      const createdAt = new Date().toISOString();
+
+      if (assessment.blocked) {
+        const record = this.database.saveCommandRun({
+          sessionId,
+          serverId: server.id,
+          createdAt,
+          finishedAt: createdAt,
+          command: safeCommand,
+          risk: assessment.risk,
+          outcome: "blocked",
+          exitCode: null,
+          stdout: "",
+          stderr: "",
+          outputTruncated: false,
+          durationMs: 0,
+          error: assessment.reason
+        });
+        this.database.audit("command.blocked", "session", sessionId, `阻断高危命令：${server.name}`, "critical", {
+          serverId: server.id,
+          commandRunId: record.id,
+          risk: assessment.risk,
+          signals: assessment.signals,
+          reason: assessment.reason
+        });
+        return { ...record, blockedReason: assessment.reason };
+      }
+
+      let outcome: CommandOutcome = "failed";
+      let exitCode: number | null = null;
+      let stdout = "";
+      let stderr = "";
+      let outputTruncated = false;
+      let durationMs: number | null = null;
+      let error: string | null = null;
+      try {
+        const result = await this.ssh.execute(server, command, timeoutMs);
+        exitCode = result.exitCode;
+        const safeStdout = redactText(result.stdout);
+        const safeStderr = redactText(result.stderr);
+        stdout = safeStdout.value;
+        stderr = safeStderr.value;
+        outputTruncated = result.outputTruncated || safeStdout.truncated || safeStderr.truncated;
+        durationMs = result.durationMs;
+        error = result.error;
+        outcome = result.timedOut ? "timed_out" : result.exitCode === 0 ? "completed" : "failed";
+      } catch (caught) {
+        error = caught instanceof Error ? redactText(caught.message, 2_000).value : "SSH 执行失败";
+        outcome = "failed";
+      }
+      const finishedAt = new Date().toISOString();
       const record = this.database.saveCommandRun({
         sessionId,
         serverId: server.id,
         createdAt,
-        finishedAt: createdAt,
+        finishedAt,
         command: safeCommand,
         risk: assessment.risk,
-        outcome: "blocked",
-        exitCode: null,
-        stdout: "",
-        stderr: "",
-        outputTruncated: false,
-        durationMs: 0,
-        error: assessment.reason
+        outcome,
+        exitCode,
+        stdout,
+        stderr,
+        outputTruncated,
+        durationMs,
+        error
       });
-      this.database.audit("command.blocked", "session", sessionId, `阻断高危命令：${server.name}`, "critical", {
+      this.database.audit("command.executed", "session", sessionId, `执行远程命令：${server.name}`, riskSeverity(assessment.risk), {
         serverId: server.id,
-        command: safeCommand,
+        commandRunId: record.id,
         risk: assessment.risk,
         signals: assessment.signals,
-        reason: assessment.reason
+        outcome,
+        exitCode,
+        durationMs
       });
-      return { ...record, blockedReason: assessment.reason };
+      return { ...record, blockedReason: null };
+    } finally {
+      this.database.releaseSessionOperation(sessionId, this.idleTimeoutMs);
     }
-
-    if (!this.database.touchActiveSession(sessionId, this.idleTimeoutMs)) {
-      throw new GatewayOperationError(409, "SessionExpired", "会话已过期，不能继续执行命令");
-    }
-
-    let outcome: CommandOutcome = "failed";
-    let exitCode: number | null = null;
-    let stdout = "";
-    let stderr = "";
-    let outputTruncated = false;
-    let durationMs: number | null = null;
-    let error: string | null = null;
-    try {
-      const result = await this.ssh.execute(server, command, timeoutMs);
-      exitCode = result.exitCode;
-      const safeStdout = redactText(result.stdout);
-      const safeStderr = redactText(result.stderr);
-      stdout = safeStdout.value;
-      stderr = safeStderr.value;
-      outputTruncated = result.outputTruncated || safeStdout.truncated || safeStderr.truncated;
-      durationMs = result.durationMs;
-      error = result.error;
-      outcome = result.timedOut ? "timed_out" : result.exitCode === 0 ? "completed" : "failed";
-    } catch (caught) {
-      error = caught instanceof Error ? caught.message : "SSH 执行失败";
-      outcome = "failed";
-    }
-    const finishedAt = new Date().toISOString();
-    const record = this.database.saveCommandRun({
-      sessionId,
-      serverId: server.id,
-      createdAt,
-      finishedAt,
-      command: safeCommand,
-      risk: assessment.risk,
-      outcome,
-      exitCode,
-      stdout,
-      stderr,
-      outputTruncated,
-      durationMs,
-      error
-    });
-    this.database.audit("command.executed", "session", sessionId, `执行远程命令：${server.name}`, riskSeverity(assessment.risk), {
-      serverId: server.id,
-      command: safeCommand,
-      risk: assessment.risk,
-      signals: assessment.signals,
-      outcome,
-      exitCode,
-      durationMs
-    });
-    this.database.touchActiveSession(sessionId, this.idleTimeoutMs);
-    return { ...record, blockedReason: null };
   }
 
-  async collectMetrics(serverId: string, sessionId?: string, requester = "metrics"): Promise<MetricSnapshot> {
+  async collectMetrics(serverId: string, sessionId?: string, capabilityToken?: string, requester = "metrics"): Promise<MetricSnapshot> {
     const server = this.database.getServer(serverId);
     if (!server) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
     const previousMetric = this.database.latestMetric(serverId);
     let temporarySession: SessionRecord | null = null;
+    let operationSessionId: string | null = null;
+    let temporaryCapabilityToken: string | null = null;
     if (sessionId) {
-      const session = this.database.getSession(sessionId, this.idleTimeoutMs);
-      if (!session || session.serverId !== serverId) throw new GatewayOperationError(409, "SessionMismatch", "会话与 VPS 不匹配");
-      if (session.status !== "active") throw new GatewayOperationError(409, "SessionNotActive", "会话尚未获得 VPS 租约", { session });
-      if (!this.database.touchActiveSession(sessionId, this.idleTimeoutMs)) {
-        throw new GatewayOperationError(409, "SessionExpired", "会话已过期，不能采集性能");
+      if (!capabilityToken) throw new GatewayOperationError(403, "MissingSessionCapability", "缺少会话能力令牌");
+      const session = this.acquireSessionOperation(sessionId, capabilityToken);
+      if (session.serverId !== serverId) {
+        this.database.releaseSessionOperation(sessionId, this.idleTimeoutMs);
+        throw new GatewayOperationError(409, "SessionMismatch", "会话与 VPS 不匹配");
       }
+      operationSessionId = sessionId;
     } else {
       try {
         this.ssh.credentialStore.pathFor(server);
@@ -532,13 +570,16 @@ export class GatewayOperations {
         recordMetricAlerts(this.database, server, previousMetric, metric);
         return metric;
       }
-      temporarySession = this.database.openSession(serverId, requesterName(requester), this.idleTimeoutMs, 5 * 60_000, false);
+      temporaryCapabilityToken = newCapabilityToken();
+      temporarySession = this.database.openSession(serverId, requesterName(requester), capabilityHash(temporaryCapabilityToken), this.idleTimeoutMs, 5 * 60_000, false);
       if (!temporarySession) {
         const metric = unavailableMetric(serverId, "服务器当前已有会话占用，稍后重试性能采集");
         this.database.saveMetric(metric);
         recordMetricAlerts(this.database, server, previousMetric, metric);
         return metric;
       }
+      this.acquireSessionOperation(temporarySession.id, temporaryCapabilityToken);
+      operationSessionId = temporarySession.id;
     }
 
     try {
@@ -572,22 +613,25 @@ export class GatewayOperations {
       });
       return metric;
     } finally {
-      if (temporarySession) this.closeSession(temporarySession.id, "metrics_completed");
-      else if (sessionId) this.database.touchActiveSession(sessionId, this.idleTimeoutMs);
+      if (operationSessionId) this.database.releaseSessionOperation(operationSessionId, this.idleTimeoutMs);
+      if (temporarySession) this.closeSessionInternal(temporarySession.id, "metrics_completed");
     }
   }
 
-  async collectInventory(serverId: string, sessionId?: string, requester = "inventory"): Promise<ServerInventory> {
+  async collectInventory(serverId: string, sessionId?: string, capabilityToken?: string, requester = "inventory"): Promise<ServerInventory> {
     const server = this.database.getServer(serverId);
     if (!server) throw new GatewayOperationError(404, "NotFound", "未找到 VPS");
     let temporarySession: SessionRecord | null = null;
+    let operationSessionId: string | null = null;
+    let temporaryCapabilityToken: string | null = null;
     if (sessionId) {
-      const session = this.database.getSession(sessionId, this.idleTimeoutMs);
-      if (!session || session.serverId !== serverId) throw new GatewayOperationError(409, "SessionMismatch", "会话与 VPS 不匹配");
-      if (session.status !== "active") throw new GatewayOperationError(409, "SessionNotActive", "会话尚未获得 VPS 租约", { session });
-      if (!this.database.touchActiveSession(sessionId, this.idleTimeoutMs)) {
-        throw new GatewayOperationError(409, "SessionExpired", "会话已过期，不能盘点项目");
+      if (!capabilityToken) throw new GatewayOperationError(403, "MissingSessionCapability", "缺少会话能力令牌");
+      const session = this.acquireSessionOperation(sessionId, capabilityToken);
+      if (session.serverId !== serverId) {
+        this.database.releaseSessionOperation(sessionId, this.idleTimeoutMs);
+        throw new GatewayOperationError(409, "SessionMismatch", "会话与 VPS 不匹配");
       }
+      operationSessionId = sessionId;
     } else {
       try {
         this.ssh.credentialStore.pathFor(server);
@@ -595,8 +639,11 @@ export class GatewayOperations {
       } catch (error) {
         throw new GatewayOperationError(409, "InventoryUnavailable", error instanceof Error ? error.message : "网关凭据不可用");
       }
-      temporarySession = this.database.openSession(serverId, requesterName(requester), this.idleTimeoutMs, 5 * 60_000, false);
+      temporaryCapabilityToken = newCapabilityToken();
+      temporarySession = this.database.openSession(serverId, requesterName(requester), capabilityHash(temporaryCapabilityToken), this.idleTimeoutMs, 5 * 60_000, false);
       if (!temporarySession) throw new GatewayOperationError(409, "ServerBusy", "服务器当前已有会话占用，请稍后盘点");
+      this.acquireSessionOperation(temporarySession.id, temporaryCapabilityToken);
+      operationSessionId = temporarySession.id;
     }
 
     try {
@@ -621,8 +668,8 @@ export class GatewayOperations {
       this.database.saveInventory(inventory);
       return inventory;
     } finally {
-      if (temporarySession) this.closeSession(temporarySession.id, "inventory_completed");
-      else if (sessionId) this.database.touchActiveSession(sessionId, this.idleTimeoutMs);
+      if (operationSessionId) this.database.releaseSessionOperation(operationSessionId, this.idleTimeoutMs);
+      if (temporarySession) this.closeSessionInternal(temporarySession.id, "inventory_completed");
     }
   }
 }

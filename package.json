@@ -1,8 +1,28 @@
 {
   "name": "ai-vps-gateway",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Local-first MCP gateway and WebUI for VPS operations.",
+  "author": "kukuaki",
+  "license": "MIT",
+  "homepage": "https://github.com/kukuaki/ai-vps-gateway",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kukuaki/ai-vps-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kukuaki/ai-vps-gateway/issues"
+  },
+  "keywords": [
+    "mcp",
+    "vps",
+    "aiops",
+    "devops",
+    "ssh",
+    "electron",
+    "claude",
+    "codex"
+  ],
   "type": "module",
   "main": "dist-electron/main.cjs",
   "scripts": {
@@ -15,9 +35,11 @@
     "sync:all-vps": "tsx scripts/sync-all-vps.ts",
     "sync:vps-projects": "tsx scripts/sync-vps-projects.ts",
     "collect:all-metrics": "tsx scripts/collect-all-metrics.ts",
+    "seed:demo": "tsx scripts/seed-demo-data.ts",
+    "check:release-safety": "tsx scripts/check-release-safety.ts",
     "import:all-vps-credentials": "tsx scripts/import-all-vps-credentials.ts",
     "typecheck": "vue-tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.server.json && tsc --noEmit -p tsconfig.desktop.json",
-    "test": "tsx --test server/**/*.test.ts",
+    "test": "tsx --test server/**/*.test.ts desktop/**/*.test.ts",
     "build:desktop-runtime": "node scripts/build-desktop.mjs",
     "build:desktop": "npm run build && npm run build:desktop-runtime",
     "run:desktop": "npm run build:desktop && electron dist-electron/main.cjs",
