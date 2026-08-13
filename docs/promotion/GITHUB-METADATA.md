@@ -55,3 +55,4 @@ Do not use Discussions for vulnerability reports. Keep security reports private 
 - GitHub description, topics, templates, Discussions settings, and social preview are repository maintenance tasks.
 - LinuxDo, V2EX, Reddit, Discord, and other community posts require human review and manual submission.
 - Do not paste real VPS addresses, domains, screenshots, logs, or configuration snippets into promotional material.
+- See [`COMMUNITY-RESEARCH.zh-CN.md`](./COMMUNITY-RESEARCH.zh-CN.md) for public demand signals and a manual posting order.
