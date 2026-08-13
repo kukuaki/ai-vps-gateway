@@ -123,7 +123,7 @@ Runtime data is stored outside the repository by default:
 
 Set `ALLVPS_DATA_DIR` to override it during development or testing.
 
-When the gateway stays running, the metric scheduler collects eligible VPS snapshots every five minutes and retains them for 30 days, including registered root assets. The overview and VPS detail pages show the stored history; CPU at 90% or above, memory at 90% or above, disk at 85% or above, and a transition to unavailable performance create a deduplicated warning audit event.
+When the gateway stays running, the metric scheduler collects eligible VPS snapshots every five minutes and retains them for 30 days, including manually added, synchronized, and registered root assets. The overview and VPS detail pages show the stored history; CPU at 90% or above, memory at 90% or above, disk at 85% or above, and a transition to unavailable performance create a deduplicated warning audit event. The bulk performance action covers every unarchived registered VPS, not only assets imported from `all-vps`.
 
 ## macOS Desktop Client
 
@@ -134,6 +134,8 @@ Build an arm64 package on an Apple Silicon Mac:
 ```bash
 npm run package:desktop
 ```
+
+The desktop packaging command uses a temporary isolated staging copy and writes artifacts to `release/`; it does not let electron-builder rewrite the source package manifest.
 
 Artifacts are written to `release/` as `.dmg` and `.zip` files. During development, `npm run run:desktop` opens the built desktop window. The app icon, WebUI brand mark, and menubar template are packaged separately so macOS can use the correct icon treatment in each location. The MCP setup button in the top-right corner can register Codex or Claude Code with one click; standard MCP connections are still spawned by the respective AI client over stdio, and the client reaches remote hosts only through the local gateway API.
 
@@ -176,7 +178,7 @@ The project inventory is a read-only SSH operation. It collects bounded metadata
 npm run sync:vps-projects
 ```
 
-The WebUI and MCP also provide single-server and all-server inventory actions.
+The WebUI and MCP also provide single-server and all-server inventory actions. The bulk project inventory covers every unarchived registered VPS, including manually added assets; the `all-vps` name remains for compatibility with the existing command and MCP tool.
 
 ## SSH Network Routing
 

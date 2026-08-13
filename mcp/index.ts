@@ -2,11 +2,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { gatewayApiToken, localGatewayBaseUrl, verifyGatewayIdentity } from "../server/auth.js";
+import { sanitizeStructuredValue } from "../server/command-policy.js";
 
 const apiBaseUrl = localGatewayBaseUrl();
 const apiToken = gatewayApiToken();
 const sessionCapabilities = new Map<string, string>();
-const MCP_PRIVATE_FIELDS = new Set(["credentialRef", "capabilityToken", "capabilityHash"]);
 
 async function apiRequest<T>(path: string, init?: RequestInit, sessionId?: string): Promise<T> {
   await verifyGatewayIdentity(apiBaseUrl, apiToken);
@@ -40,11 +40,7 @@ async function apiPatch<T>(path: string, body: unknown): Promise<T> {
 }
 
 function sanitizeMcpResult(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sanitizeMcpResult);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value).flatMap(([key, entry]) => MCP_PRIVATE_FIELDS.has(key) ? [] : [[key, sanitizeMcpResult(entry)]])
-  );
+  return sanitizeStructuredValue(value);
 }
 
 function jsonResult(value: unknown) {
@@ -58,7 +54,7 @@ function errorResult(error: unknown) {
   };
 }
 
-const server = new McpServer({ name: "ai-vps-gateway", version: "0.1.1" });
+const server = new McpServer({ name: "ai-vps-gateway", version: "0.1.2" });
 
 const projectRunbookInput = z.object({
   overview: z.string().trim().max(12_000).default(""),
@@ -261,7 +257,7 @@ server.registerTool(
   "collect_all_metrics",
   {
     title: "Collect all VPS metrics",
-    description: "依次通过本机网关采集所有未归档 all-vps VPS 的当前 CPU、内存、根盘和 load 1m 快照。每台 VPS 使用短暂内部租约，不会绕过其他 AI 会话的独占锁。",
+    description: "依次通过本机网关采集所有未归档、已登记 VPS（包括手动添加和 all-vps 同步资产）的当前 CPU、内存、根盘和 load 1m 快照。每台 VPS 使用短暂内部租约，不会绕过其他 AI 会话的独占锁。",
     annotations: { destructiveHint: false }
   },
   async () => {
@@ -337,7 +333,7 @@ server.registerTool(
   "sync_all_vps_projects",
   {
     title: "Inventory all VPS projects",
-    description: "依次通过只读 SSH 盘点所有未归档 all-vps VPS 的 Docker、systemd、监听端口和常见项目清单，并更新本机项目档案与自动 Runbook。不会读取环境变量、密钥或配置内容。"
+    description: "依次通过只读 SSH 盘点所有未归档、已登记 VPS（包括手动添加和 all-vps 同步资产）的 Docker、systemd、监听端口和常见项目清单，并更新本机项目档案与自动 Runbook。不会读取环境变量、密钥或配置内容。"
   },
   async () => {
     try {

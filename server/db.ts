@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { redactText, sanitizeAuditMetadata } from "./command-policy.js";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AuditEvent,
@@ -1845,6 +1846,8 @@ export class GatewayDatabase {
     severity: AuditSeverity = "info",
     metadata: Record<string, unknown> = {}
   ): AuditEvent {
+    const safeMetadata = sanitizeAuditMetadata(metadata);
+    const safeSummary = redactText(summary, 2_000).value;
     const event: AuditEvent = {
       id: randomUUID(),
       createdAt: now(),
@@ -1852,12 +1855,12 @@ export class GatewayDatabase {
       targetType,
       targetId,
       severity,
-      summary,
-      metadata
+      summary: safeSummary,
+      metadata: safeMetadata
     };
     this.db
       .prepare("INSERT INTO audit_events (id, created_at, action, target_type, target_id, severity, summary, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(event.id, event.createdAt, action, targetType, targetId, severity, summary, JSON.stringify(metadata));
+      .run(event.id, event.createdAt, action, targetType, targetId, severity, safeSummary, JSON.stringify(safeMetadata));
     return event;
   }
 

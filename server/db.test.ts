@@ -79,4 +79,20 @@ describe("GatewayDatabase", () => {
     assert.equal(database.metricHistory(server.id, 10)[0]?.collectedAt, "2026-08-09T00:00:00.000Z");
     database.close();
   });
+
+  it("redacts credential-bearing audit metadata before persistence", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-db-audit-redaction-"));
+    temporaryDirectories.push(directory);
+    const database = new GatewayDatabase(directory);
+
+    const event = database.audit("test.sensitive", "server", null, "脱敏测试", "warning", {
+      credentialRef: "gateway-generated-secret.ed25519",
+      nested: { token: "secret-value", note: "保留" }
+    });
+
+    assert.equal("credentialRef" in event.metadata, false);
+    assert.deepEqual(event.metadata.nested, { note: "保留" });
+    assert.doesNotMatch(JSON.stringify(database.recentAudit()[0]?.metadata), /secret-value|gateway-generated/);
+    database.close();
+  });
 });

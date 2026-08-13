@@ -123,7 +123,7 @@ npm run build
 
 开发或测试时可以设置 `ALLVPS_DATA_DIR` 覆盖该目录。
 
-只要网关进程持续运行，性能调度器默认每 5 分钟采集一次符合条件的 VPS（包括已登记的 root VPS），并保留 30 天。概览和 VPS 详情页会显示历史趋势；CPU 达到 90%、内存达到 90%、磁盘达到 85%，或性能从可用变为不可用时，会写入去重后的 warning 审计告警。
+只要网关进程持续运行，性能调度器默认每 5 分钟采集一次符合条件的 VPS（包括手动添加、清单同步和已登记的 root VPS），并保留 30 天。概览和 VPS 详情页会显示历史趋势；CPU 达到 90%、内存达到 90%、磁盘达到 85%，或性能从可用变为不可用时，会写入去重后的 warning 审计告警。“立即采集全部性能”会覆盖所有未归档的已登记 VPS，不只处理从 `all-vps` 导入的资产。
 
 ## macOS 桌面客户端
 
@@ -134,6 +134,8 @@ npm run build
 ```bash
 npm run package:desktop
 ```
+
+桌面打包命令会先复制到临时隔离 staging 目录，再把产物写入 `release/`；不会让 electron-builder 改写源码的 package manifest。
 
 产物位于 `release/`，包括 `.dmg` 和 `.zip`。开发时可用 `npm run run:desktop` 启动已构建的桌面窗口。应用图标、WebUI 品牌标识和菜单栏模板分别打包，确保三个位置使用正确的图形。应用右上角的 MCP 设置入口可以一键登记 Codex 或 Claude Code；标准 MCP 连接仍由对应 AI 客户端按 stdio 启动，客户端只通过本机网关 API 工作。
 
@@ -176,7 +178,7 @@ npm run sync:all-vps
 npm run sync:vps-projects
 ```
 
-WebUI 和 MCP 都支持单台及全部 VPS 的项目盘点。
+WebUI 和 MCP 都支持单台及全部 VPS 的项目盘点。批量项目盘点会覆盖所有未归档的已登记 VPS，包括手动添加的资产；`all-vps` 名称仅为兼容现有命令和 MCP 工具而保留。
 
 ## SSH 网络路径
 

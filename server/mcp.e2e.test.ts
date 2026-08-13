@@ -81,7 +81,7 @@ describe("MCP stdio gateway", () => {
       },
       stderr: "pipe"
     });
-    const client = new Client({ name: "ai-vps-gateway-e2e", version: "0.1.1" });
+    const client = new Client({ name: "ai-vps-gateway-e2e", version: "0.1.2" });
 
     try {
       await client.connect(transport);
@@ -108,6 +108,11 @@ describe("MCP stdio gateway", () => {
       assert.equal(result.outcome, "completed");
       assert.match(result.stdout, /mcp-command-ok/);
       assert.doesNotMatch(result.stdout, /should-redact/);
+
+      const sessionDetail = textPayload(await client.callTool({ name: "get_session", arguments: { sessionId: session.id } }));
+      const commandHistory = (sessionDetail.session as { commands: Array<{ command: string; stdout: string }> }).commands;
+      assert.equal(commandHistory[0]?.command, "printf mcp-command-ok");
+      assert.doesNotMatch(commandHistory[0]?.stdout ?? "", /should-redact/);
 
       const closed = textPayload(await client.callTool({
         name: "close_session",

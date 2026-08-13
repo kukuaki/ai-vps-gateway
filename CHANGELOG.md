@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.2] - 2026-08-13
+
+### Fixed
+
+- Bulk performance collection and project inventory now include every unarchived registered VPS, including manually added assets.
+- Recursively sanitize credential-bearing fields in MCP responses and persisted audit metadata while keeping redacted command history available to the AI client.
+- Production frontend builds no longer create or chmod the runtime data directory just to load the Vite configuration.
+- Desktop packaging now builds from an isolated staging copy, so electron-builder cannot rewrite the source package manifest.
+
 ## [0.1.1] - 2026-08-13
 
 ### Security And Reliability

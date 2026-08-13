@@ -485,7 +485,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
     return {
       ok: true,
       mode: "local-only",
-      version: "0.1.1",
+      version: "0.1.2",
       proof: apiToken && challenge ? gatewayHealthProof(apiToken, challenge) : null
     };
   });
@@ -588,7 +588,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
 
   app.post("/api/metrics/all", async () => {
     const results: Array<{ serverId: string; metric?: ReturnType<GatewayDatabase["latestMetric"]>; error?: string }> = [];
-    for (const server of database.listServersBySource("all-vps").filter((item) => !item.archivedAt)) {
+    for (const server of database.listServers().filter((item) => !item.archivedAt)) {
       try {
         results.push({ serverId: server.id, metric: await operations.collectMetrics(server.id, undefined, undefined, "webui:all-metrics") });
       } catch (error) {
@@ -643,7 +643,7 @@ export async function buildApp(database = new GatewayDatabase(), options: Gatewa
 
   app.post("/api/inventory/all-vps/sync-projects", async (_request, reply) => {
     const results: Array<InventorySyncResult | { serverId: string; error: string }> = [];
-    for (const server of database.listServersBySource("all-vps").filter((item) => !item.archivedAt)) {
+    for (const server of database.listServers().filter((item) => !item.archivedAt)) {
       try {
         const inventory = await operations.collectInventory(server.id, undefined, undefined, "webui:all-vps-project-sync");
         results.push(syncInventoryProjects(database, server, inventory));

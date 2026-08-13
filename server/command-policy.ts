@@ -10,6 +10,40 @@ export interface CommandAssessment {
   signals: string[];
 }
 
+const SENSITIVE_STRUCTURED_KEYS = new Set([
+  "apikey",
+  "accesstoken",
+  "accesskey",
+  "authorization",
+  "bearer",
+  "capabilityhash",
+  "capabilitytoken",
+  "clientsecret",
+  "credentialref",
+  "databaseurl",
+  "dburl",
+  "identityfile",
+  "jwt",
+  "knownhosts",
+  "password",
+  "privatekey",
+  "refreshtoken",
+  "secret",
+  "sessiontoken",
+  "sshkey",
+  "token"
+]);
+
+const AUDIT_ONLY_SENSITIVE_KEYS = new Set([
+  "command",
+  "commandtext",
+  "output",
+  "rawcommand",
+  "rawoutput",
+  "stderr",
+  "stdout"
+]);
+
 const hardBlockRules: Array<{ pattern: RegExp; reason: string }> = [
   {
     pattern: /:\s*\(\)\s*\{\s*:\s*\|\s*:\s*(?:&\s*)?\}\s*;?/i,
@@ -108,17 +142,64 @@ export function redactText(value: string, maxBytes = MAX_OUTPUT_BYTES): { value:
   let redacted = value
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gi, "[REDACTED_PEM]")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/g, "[REDACTED_TOKEN]")
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[REDACTED_AWS_KEY]")
     .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_JWT]")
     .replace(/(\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|amqp(?:s)?)?:\/\/[^\s:/@]+:)([^\s/@]+)(@)/gi, "$1[REDACTED]$3")
+    .replace(/([?&](?:access[_-]?key|api[_-]?key|authorization|bearer|password|secret|token)=)([^&#\s]+)/gi, "$1[REDACTED]")
     .replace(/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)([^\s,;&]+)/gi, "$1[REDACTED]")
-    .replace(/(["']?(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|database[_-]?url|db[_-]?url|jwt)["']?\s*[=:]\s*)(["'])([\s\S]*?)\2/gi, "$1$2[REDACTED]$2")
-    .replace(/(\b(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|database[_-]?url|db[_-]?url|jwt)\b\s*[=:]\s*)([^\s,;&]+)/gi, "$1[REDACTED]")
-    .replace(/(\b(?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|database[_-]?url|db[_-]?url|jwt)\b\s+)([^\s,;&]+)/gi, "$1[REDACTED]");
+    .replace(/(["']?(?:access[_-]?token|password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|client[_-]?secret|database[_-]?url|db[_-]?url|jwt|refresh[_-]?token|session[_-]?token)["']?\s*[=:]\s*)(["'])([\s\S]*?)\2/gi, "$1$2[REDACTED]$2")
+    .replace(/(\b(?:access[_-]?token|password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|client[_-]?secret|database[_-]?url|db[_-]?url|jwt|refresh[_-]?token|session[_-]?token)\b\s*[=:]\s*)([^\s,;&]+)/gi, "$1[REDACTED]")
+    .replace(/(\b(?:access[_-]?token|password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer|client[_-]?secret|database[_-]?url|db[_-]?url|jwt|refresh[_-]?token|session[_-]?token)\b\s+)([^\s,;&]+)/gi, "$1[REDACTED]");
   const bytes = Buffer.byteLength(redacted, "utf8");
   if (bytes <= maxBytes) return { value: redacted, truncated: false };
   const buffer = Buffer.from(redacted, "utf8");
   redacted = buffer.subarray(0, maxBytes).toString("utf8");
   return { value: `${redacted}\n[OUTPUT_TRUNCATED]`, truncated: true };
+}
+
+function normalizedStructuredKey(key: string): string {
+  return key.toLowerCase().replace(/[-_\s]/g, "");
+}
+
+/** Keep audit and MCP JSON useful while removing credential-bearing fields recursively. */
+export function sanitizeStructuredValue(value: unknown, additionalOmittedKeys: ReadonlySet<string> = new Set()): unknown {
+  const seen = new WeakSet<object>();
+
+  const visit = (current: unknown, depth: number): unknown => {
+    if (typeof current === "string") return redactText(current, 4_000).value;
+    if (current === null || typeof current === "number" || typeof current === "boolean") return current;
+    if (typeof current === "bigint") return "[REDACTED_UNSUPPORTED_VALUE]";
+    if (depth >= 8) return "[REDACTED_DEPTH]";
+    if (typeof current !== "object") return "[REDACTED_UNSUPPORTED_VALUE]";
+    if (seen.has(current)) return "[REDACTED_CYCLE]";
+
+    seen.add(current);
+    try {
+      if (Array.isArray(current)) {
+        const values = current.slice(0, 100).map((item) => visit(item, depth + 1));
+        if (current.length > values.length) values.push("[REDACTED_ITEMS]");
+        return values;
+      }
+
+      const result: Record<string, unknown> = {};
+      const entries = Object.entries(current);
+      for (const [key, entry] of entries.slice(0, 100)) {
+        const normalizedKey = normalizedStructuredKey(key);
+        if (SENSITIVE_STRUCTURED_KEYS.has(normalizedKey) || additionalOmittedKeys.has(normalizedKey)) continue;
+        result[key] = visit(entry, depth + 1);
+      }
+      if (entries.length > 100) result._truncated = true;
+      return result;
+    } finally {
+      seen.delete(current);
+    }
+  };
+
+  return visit(value, 0);
+}
+
+export function sanitizeAuditMetadata(value: unknown): Record<string, unknown> {
+  return sanitizeStructuredValue(value, AUDIT_ONLY_SENSITIVE_KEYS) as Record<string, unknown>;
 }
 
 export function displayCommand(command: string): string {

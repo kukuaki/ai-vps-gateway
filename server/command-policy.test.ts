@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { assessCommand, redactText } from "./command-policy.js";
+import { assessCommand, redactText, sanitizeAuditMetadata, sanitizeStructuredValue } from "./command-policy.js";
 
 describe("command policy", () => {
   it("blocks a small set of irreversible host destruction patterns", () => {
@@ -38,5 +38,24 @@ describe("command policy", () => {
     assert.match(result.value, /DATABASE_URL=\[REDACTED\]/);
     assert.match(result.value, /\[REDACTED_PEM\]/);
     assert.equal(redactText("x".repeat(20), 8).truncated, true);
+  });
+
+  it("sanitizes nested MCP values without hiding redacted command history", () => {
+    const value = sanitizeStructuredValue({
+      credentialRef: "gateway-generated-secret.ed25519",
+      capabilityToken: "session-capability",
+      command: "sudo systemctl restart nginx",
+      stdout: "token=secret-value",
+      nested: { password: "nested-secret", note: "ok" }
+    }) as Record<string, unknown>;
+
+    assert.equal("credentialRef" in value, false);
+    assert.equal("capabilityToken" in value, false);
+    assert.equal(value.command, "sudo systemctl restart nginx");
+    assert.equal(value.stdout, "token=[REDACTED]");
+    assert.deepEqual(value.nested, { note: "ok" });
+
+    const auditValue = sanitizeAuditMetadata({ command: "rm -rf /", stdout: "password=secret", note: "keep" });
+    assert.deepEqual(auditValue, { note: "keep" });
   });
 });

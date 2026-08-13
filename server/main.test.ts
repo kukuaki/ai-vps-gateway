@@ -383,7 +383,7 @@ describe("local API", () => {
     await app.close();
   });
 
- it("serves metric history and performance alerts", async () => {
+  it("serves metric history and performance alerts", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-metrics-"));
     temporaryDirectories.push(directory);
     const database = new GatewayDatabase(directory);
@@ -408,6 +408,64 @@ describe("local API", () => {
     const alertsResponse = await app.inject({ method: "GET", url: "/api/alerts?limit=10" });
     assert.equal(alertsResponse.statusCode, 200);
     assert.equal(alertsResponse.json().alerts[0].summary, "性能告警：性能 API 节点 · CPU 高");
+    await app.close();
+  });
+
+  it("includes manually added VPS in bulk metrics and project inventory", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ai-vps-gateway-api-bulk-manual-"));
+    temporaryDirectories.push(directory);
+    const credentialsDirectory = join(directory, "credentials");
+    const knownHostsPath = join(directory, "known_hosts");
+    const fakeSshPath = join(directory, "fake-ssh.sh");
+    mkdirSync(credentialsDirectory);
+    writeFileSync(join(credentialsDirectory, "test-key"), "test");
+    writeFileSync(knownHostsPath, "[203.0.113.91]:22 ssh-ed25519 test\n");
+    writeFileSync(
+      fakeSshPath,
+      `#!/bin/sh
+case "$*" in
+  *cpu_sample*) printf 'cpu_percent=12.5\nmemory_percent=34.5\ndisk_percent=45\nload1=0.42\n' ;;
+  *) printf '%s\n' '__AI_VPS_GATEWAY_INVENTORY_V2__' 'META\thostname\tmanual-node' 'META\tos\tUbuntu 24.04' 'PROJECT\tnode\t/srv/manual/package.json' 'SERVICE\tprocess\tpm2:manual\tmanual\tonline\t127.0.0.1:3000\t/srv/manual\tmanual\t/srv/manual\t' ;;
+esac
+`
+    );
+    chmodSync(fakeSshPath, 0o755);
+
+    const database = new GatewayDatabase(directory);
+    const server = database.createServer({
+      name: "手动批量节点",
+      address: "203.0.113.91",
+      sshPort: 22,
+      sshUser: "ubuntu",
+      credentialRef: "test-key"
+    });
+    const app = await buildApp(database, {
+      apiToken: false,
+      disableSchedulers: true,
+      operationOptions: {
+        sshExecutor: new SshExecutor({
+          credentialStore: new CredentialStore(credentialsDirectory, knownHostsPath),
+          sshBinary: fakeSshPath,
+          timeoutMs: 5_000
+        }),
+        idleTimeoutMs: 60_000,
+        maxSessionDurationMs: 600_000
+      }
+    });
+    await app.ready();
+
+    const metricsResponse = await app.inject({ method: "POST", url: "/api/metrics/all", payload: {} });
+    assert.equal(metricsResponse.statusCode, 200);
+    assert.deepEqual(metricsResponse.json().results.map((item: { serverId: string }) => item.serverId), [server.id]);
+    assert.equal(metricsResponse.json().results[0].metric.source, "ssh");
+
+    const inventoryResponse = await app.inject({ method: "POST", url: "/api/inventory/all-vps/sync-projects", payload: {} });
+    assert.equal(inventoryResponse.statusCode, 200);
+    assert.deepEqual(inventoryResponse.json().summary, { total: 1, success: 1, failed: 0, created: 1, updated: 0, archived: 0 });
+    assert.equal(database.listProjects().length, 1);
+    const project = database.getProject(database.listProjects()[0]!.id);
+    assert.equal(project?.serverCount, 1);
+    assert.equal(project?.servers[0]?.serverId, server.id);
     await app.close();
   });
 
