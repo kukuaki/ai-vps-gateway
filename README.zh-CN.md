@@ -14,6 +14,7 @@
 
 <p align="center">
   <a href="./README.md">English</a> ·
+  <a href="https://kukuaki.github.io/ai-vps-gateway/">项目介绍页</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#mcp">MCP</a> ·
   <a href="https://github.com/kukuaki/ai-vps-gateway/releases/latest">下载 macOS 版本</a>
@@ -40,6 +41,16 @@
 | **项目运维** | 服务盘点、技术栈、端口、Web 入口、部署说明和持久化 Runbook。 |
 | **AI 接入** | 面向 Codex 与 Claude Code 的本机 stdio MCP；同一 VPS 同时只允许一个活动会话，后续请求排队。 |
 | **可观测性** | 当前性能快照、30 天历史、趋势图、阈值告警和审计事件。 |
+
+## 展示图
+
+<p align="center">
+  <a href="https://kukuaki.github.io/ai-vps-gateway/">
+    <img src="./site/assets/showcase/dashboard.jpg" width="820" alt="AI VPS Gateway 演示仪表盘，展示 VPS 状态与性能趋势">
+  </a>
+</p>
+
+<p align="center"><sub>所有展示图均使用仓库演示数据和文档保留 IP 地址。完整产品导览见 <a href="https://kukuaki.github.io/ai-vps-gateway/">项目介绍页</a>。</sub></p>
 
 ## 快速开始
 
@@ -258,6 +269,7 @@ claude mcp get ai-vps-gateway
 
 ## 项目链接
 
+- [项目介绍页](https://kukuaki.github.io/ai-vps-gateway/)
 - [贡献指南](./CONTRIBUTING.md)
 - [路线图](./ROADMAP.md)
 - [变更记录](./CHANGELOG.md)

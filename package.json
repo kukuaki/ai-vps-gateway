@@ -5,7 +5,7 @@
   "description": "Local-first MCP gateway and WebUI for VPS operations.",
   "author": "kukuaki",
   "license": "MIT",
-  "homepage": "https://github.com/kukuaki/ai-vps-gateway",
+  "homepage": "https://kukuaki.github.io/ai-vps-gateway/",
   "repository": {
     "type": "git",
     "url": "https://github.com/kukuaki/ai-vps-gateway.git"

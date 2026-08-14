@@ -14,6 +14,7 @@
 
 <p align="center">
   <a href="./README.zh-CN.md">中文文档</a> ·
+  <a href="https://kukuaki.github.io/ai-vps-gateway/">Project website</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#mcp">MCP</a> ·
   <a href="https://github.com/kukuaki/ai-vps-gateway/releases/latest">macOS release</a>
@@ -40,6 +41,16 @@
 | **Project operations** | Service inventory, technology stacks, ports, Web endpoints, deployment notes and persistent Runbooks. |
 | **AI access** | Local stdio MCP tools for Codex and Claude Code, with one active session per VPS and queueing for later requests. |
 | **Observability** | Current snapshots, 30-day metric history, trend charts, threshold alerts and audit events. |
+
+## Screenshots
+
+<p align="center">
+  <a href="https://kukuaki.github.io/ai-vps-gateway/">
+    <img src="./site/assets/showcase/dashboard.jpg" width="820" alt="Demo AI VPS Gateway dashboard showing VPS status and performance trends">
+  </a>
+</p>
+
+<p align="center"><sub>All screenshots use repository demo data and documentation-only IP ranges. See the <a href="https://kukuaki.github.io/ai-vps-gateway/">project website</a> for the complete product tour.</sub></p>
 
 ## Quick start
 
@@ -258,6 +269,7 @@ Restart the client after registration if its tool list was already open. In a co
 
 ## Project Links
 
+- [Project website](https://kukuaki.github.io/ai-vps-gateway/)
 - [Contributing](./CONTRIBUTING.md)
 - [Roadmap](./ROADMAP.md)
 - [Changelog](./CHANGELOG.md)

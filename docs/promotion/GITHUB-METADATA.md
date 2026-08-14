@@ -30,7 +30,7 @@ Topics are intentionally lowercase and hyphenated. Keep the final list focused r
 **Website**
 
 ```text
-https://github.com/kukuaki/ai-vps-gateway#readme
+https://kukuaki.github.io/ai-vps-gateway/
 ```
 
 ## Social Preview
