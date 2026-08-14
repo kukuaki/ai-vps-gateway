@@ -33,6 +33,12 @@ Topics are intentionally lowercase and hyphenated. Keep the final list focused r
 https://kukuaki.github.io/ai-vps-gateway/
 ```
 
+## Project Website Deployment
+
+The repository publishes the static project website from [`../../site/`](../../site/) through [`.github/workflows/deploy-pages.yml`](../../.github/workflows/deploy-pages.yml).
+
+For the first deployment, a repository administrator must enable Pages once in **Settings** -> **Pages** and select **GitHub Actions** under **Build and deployment**. Later changes to `site/` on `main` deploy automatically. The workflow intentionally does not publish the application runtime, local SQLite data, credentials, or any `all-vps` source files.
+
 ## Social Preview
 
 Use [`../../assets/social-preview.png`](../../assets/social-preview.png). It is a generated demo graphic and contains no runtime data. GitHub recommends a PNG, JPG, or GIF under 1 MB and a display size of at least 640x320; the project asset is 1280x640.
